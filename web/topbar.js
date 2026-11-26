@@ -61,36 +61,40 @@
       const wsUrl = typeof url === "string" ? url : String(url);
       let resolvedWsUrl = wsUrl;
       let authToken = null;
+      let pathname = "";
       try {
         const baseHref =
           window.location && window.location.href ? window.location.href : "http://127.0.0.1/";
         const urlObj = new URL(wsUrl, baseHref);
         resolvedWsUrl = urlObj.href;
         authToken = urlObj.searchParams.get("token");
+        pathname = urlObj.pathname || "";
       } catch {}
-      const httpBase = resolvedWsUrl.replace(/^ws(s?):/, "http$1:").replace(/\/ws(\?.*)?$/, "");
+      if (!pathname.startsWith("/api/agent/")) {
+        const httpBase = resolvedWsUrl.replace(/^ws(s?):/, "http$1:").replace(/\/ws(\?.*)?$/, "");
 
-      ws.addEventListener("message", (event) => {
-        if (!autoDownloadEnabled || typeof event.data !== "string") return;
-        if (!event.data.includes('"executed"')) return;
-        let msg;
-        try {
-          msg = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (!msg || msg.type !== "executed" || !msg.data || !msg.data.output || typeof msg.data.output !== "object") {
-          return;
-        }
-        const output = msg.data.output;
-        const eventKey = `${msg.data.prompt_id || ""}|${msg.data.node || ""}`;
-        for (const items of Object.values(output)) {
-          if (!Array.isArray(items) || items.length === 0) continue;
-          for (const item of items) {
-            _downloadOutputItem(httpBase, authToken, eventKey, item);
+        ws.addEventListener("message", (event) => {
+          if (!autoDownloadEnabled || typeof event.data !== "string") return;
+          if (!event.data.includes('"executed"')) return;
+          let msg;
+          try {
+            msg = JSON.parse(event.data);
+          } catch {
+            return;
           }
-        }
-      });
+          if (!msg || msg.type !== "executed" || !msg.data || !msg.data.output || typeof msg.data.output !== "object") {
+            return;
+          }
+          const output = msg.data.output;
+          const eventKey = `${msg.data.prompt_id || ""}|${msg.data.node || ""}`;
+          for (const items of Object.values(output)) {
+            if (!Array.isArray(items) || items.length === 0) continue;
+            for (const item of items) {
+              _downloadOutputItem(httpBase, authToken, eventKey, item);
+            }
+          }
+        });
+      }
 
       return ws;
     }
@@ -660,6 +664,7 @@
       }
       restartBtn.disabled = false;
       restartBtn.classList.remove("is-busy");
+      fetch("/__rp_bridge/agent/refresh", { method: "POST" }).catch(() => {});
     }
 
     if (typeof api?.addEventListener === "function") {

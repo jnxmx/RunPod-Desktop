@@ -7,7 +7,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -23,7 +23,7 @@ from .config import (
 )
 from .runpod_client import RunPodClient, is_valid_pod_id
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 WEB_DIR = Path(__file__).resolve().parent / "web"
 DEPLOYER_DIR = WEB_DIR / "deployer"
 
@@ -45,10 +45,12 @@ class BridgeAPI:
         runpod_client: Optional[RunPodClient] = None,
         config_path: Path = CONFIG_PATH,
         url_opener: Callable[[str], bool] = webbrowser.open,
+        agent_refresher: Optional[Callable[[str, bool], Awaitable[dict[str, Any]]]] = None,
     ) -> None:
         self.client = runpod_client or RunPodClient()
         self.config_path = config_path
         self.url_opener = url_opener
+        self._agent_refresher = agent_refresher
         cfg = load_config(self.config_path)
         self.state = BridgeState(
             mode="deployer",
@@ -110,6 +112,9 @@ class BridgeAPI:
 
         if path == "/__rp_bridge/auto_download" and method == "POST":
             return await self._handle_auto_download(request)
+
+        if path == "/__rp_bridge/agent/refresh" and method == "POST":
+            return await self._handle_agent_refresh(request)
 
         if path == "/__rp_bridge/topbar.js" and method == "GET":
             return self._serve_static(WEB_DIR / "topbar.js", "application/javascript")
@@ -325,6 +330,8 @@ class BridgeAPI:
         self._pods_summary_cache_ts = 0.0
         self._pods_summary_cache_data = None
         save_config({"active_pod": active_pod}, self.config_path)
+        if self._agent_refresher is not None:
+            asyncio.create_task(self._safe_refresh_agent(pod_id, force=False))
         return web.json_response({"ok": True, "mode": "remote", "activePod": active_pod})
 
     async def _handle_disconnect(self, _request: web.Request) -> web.Response:
@@ -448,3 +455,22 @@ class BridgeAPI:
             {"ok": True, "autoDownloadOutputs": enabled},
             headers={"Cache-Control": "no-store"},
         )
+
+    async def _safe_refresh_agent(self, pod_id: str, *, force: bool = False) -> dict[str, Any]:
+        if self._agent_refresher is None:
+            return {"ok": False, "reason": "unconfigured"}
+        try:
+            return await self._agent_refresher(pod_id, force)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def _handle_agent_refresh(self, _request: web.Request) -> web.Response:
+        pod_id = str((self.state.active_pod or {}).get("podId") or "").strip()
+        if self.state.mode != "remote" or not is_valid_pod_id(pod_id):
+            return web.json_response(
+                {"ok": False, "reason": "not_connected"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        result = await self._safe_refresh_agent(pod_id, force=True)
+        return web.json_response(result, headers={"Cache-Control": "no-store"})

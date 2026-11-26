@@ -7,6 +7,11 @@ from typing import Optional
 
 from aiohttp import web
 
+from .agent_bridge import (
+    LocalAgentCatalogRefresher,
+    get_local_agent_feature_flag,
+    is_local_agent_path,
+)
 from .bridge_api import BridgeAPI
 from .proxy import PodProxy
 from .runpod_client import RunPodClient
@@ -35,8 +40,14 @@ def create_bridge_middleware(
     pod_proxy: Optional[PodProxy] = None,
 ):
     """Build the aiohttp middleware that routes between deployer, remote pod, and healthchecks."""
-    api = bridge_api or BridgeAPI()
-    proxy = pod_proxy or PodProxy()
+    proxy = pod_proxy or PodProxy(agent_feature_provider=get_local_agent_feature_flag)
+    if bridge_api is not None:
+        api = bridge_api
+    else:
+        refresher = LocalAgentCatalogRefresher(on_status_change=proxy.broadcast_agent_status)
+        api = BridgeAPI(
+            agent_refresher=lambda pod_id, force=False: refresher.refresh_for_pod(pod_id, force=force)
+        )
 
     @web.middleware
     async def runpod_desktop_middleware(request: web.Request, handler):
@@ -44,6 +55,9 @@ def create_bridge_middleware(
 
         if path.startswith("/__rp_bridge/"):
             return await api.handle_bridge_request(request)
+
+        if is_local_agent_path(path):
+            return await handler(request)
 
         if api.state.mode == "remote":
             pod_id = str((api.state.active_pod or {}).get("podId") or "").strip()
@@ -91,8 +105,12 @@ def _install_on_comfy_server() -> None:
         return
 
     client = RunPodClient()
-    api = BridgeAPI(runpod_client=client)
-    proxy = PodProxy()
+    proxy = PodProxy(agent_feature_provider=get_local_agent_feature_flag)
+    refresher = LocalAgentCatalogRefresher(on_status_change=proxy.broadcast_agent_status)
+    api = BridgeAPI(
+        runpod_client=client,
+        agent_refresher=lambda pod_id, force=False: refresher.refresh_for_pod(pod_id, force=force),
+    )
     middleware, _, _ = create_bridge_middleware(bridge_api=api, pod_proxy=proxy)
 
     app.middlewares.insert(0, middleware)
