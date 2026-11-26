@@ -9,6 +9,6 @@ dependencies = []
 Repository = "https://github.com/jnxmx/RunPod-Desktop"
 
 [tool.comfy]
-PublisherId = "jnxmx"
+PublisherId = "jnx"
 DisplayName = "Comfy Course Deployer"
 Icon = ""
