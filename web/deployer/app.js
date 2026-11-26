@@ -391,7 +391,7 @@ function getScopeLabelForPath(path) {
   if (path.startsWith("/templates/")) return "Templates (Read)";
   if (path.startsWith("/catalog/")) return "Catalog (Read)";
   if (path.startsWith("/pods")) return "Pods (Read + Write)";
-  return "REST API";
+  return "Developer API";
 }
 
 function formatRussianDays(days) {
@@ -3891,7 +3891,7 @@ async function init() {
       if (onbRestDesc) {
         onbRestDesc.textContent = rest.ok
           ? (rest.allResources ? "All resources (Read + Write)" : "Pods · Templates · Catalog доступны")
-          : `Не хватает: ${(rest.missing || []).join(", ") || "доступа REST"}`;
+          : `Не хватает: ${(rest.missing || []).join(", ") || "доступа Developer API"}`;
       }
       if (onbRestStatus) onbRestStatus.textContent = isExpired ? "Недоступно" : (rest.ok ? "Подтверждено" : "Неполные права");
       setToneClass(onbRestStatus, isExpired ? "is-muted" : (rest.ok ? "is-ok" : "is-warn"));
