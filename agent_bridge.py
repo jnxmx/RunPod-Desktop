@@ -102,9 +102,20 @@ class LocalAgentCatalogRefresher:
 
             state = st.get("state")
             if state == "starting":
-                self._synced_pod_id = clean_pod_id
-                self._start_watcher(mod)
-                return {"ok": True, "refreshed": False, "reason": "already_starting"}
+                loop = asyncio.get_running_loop()
+                wait_deadline = loop.time() + 25.0
+                while state == "starting" and loop.time() < wait_deadline:
+                    if stopping is not None and callable(getattr(stopping, "is_set", None)) and stopping.is_set():
+                        return {"ok": False, "refreshed": False, "reason": "agent_stopping"}
+                    await asyncio.sleep(0.3)
+                    try:
+                        st = host.status()
+                    except Exception:
+                        return {"ok": False, "refreshed": False, "reason": "status_error"}
+                    if not isinstance(st, dict):
+                        return {"ok": False, "refreshed": False, "reason": "not_ready"}
+                    state = st.get("state")
+
             if state != "ready":
                 return {"ok": False, "refreshed": False, "reason": str(state or "not_ready")}
 
@@ -112,7 +123,7 @@ class LocalAgentCatalogRefresher:
             # if restarts happened within STABLE_S (60s).
             restarts = int(st.get("restarts") or 0)
             max_restarts = int(st.get("max_restarts") or 3)
-            if restarts >= max(1, max_restarts - 1):
+            if restarts >= max(1, max_restarts):
                 return {"ok": False, "refreshed": False, "reason": "restart_budget_low"}
 
             handle = getattr(host, "_handle", None)
@@ -167,16 +178,26 @@ def resolve_agent_data_dir(agent_host_mod: Any = None) -> Optional[Path]:
         return None
 
 
-def build_runpod_agents_block(active_pod: dict[str, Any], comfy_url: str) -> str:
+def build_runpod_agents_block(active_pod: Optional[dict[str, Any]], comfy_url: str) -> str:
     """Build the managed RunPod standing instructions block for comfy-agent's AGENTS.md."""
-    pod_id = str(active_pod.get("podId") or "").strip()
-    gpu_name = str(active_pod.get("gpuName") or "GPU").strip() or "GPU"
     base_url = (comfy_url or "http://127.0.0.1:8188").rstrip("/")
+    pod_id = str((active_pod or {}).get("podId") or "").strip()
+    gpu_name = str((active_pod or {}).get("gpuName") or "GPU").strip() or "GPU"
+    if pod_id:
+        target_line = (
+            f"- Active ComfyUI target: RunPod Linux container (`{pod_id}`, GPU `{gpu_name}`, "
+            f"ComfyUI root `/workspace/ComfyUI`), proxied through `{base_url}`."
+        )
+    else:
+        target_line = (
+            "- Comfy Desktop operates in **RunPod Remote Proxy mode**: ComfyUI runs on a remote RunPod "
+            f"Linux GPU container at `/workspace/ComfyUI` (proxied through `{base_url}`), NEVER on this local machine."
+        )
     return (
         f"{AGENTS_BLOCK_BEGIN}\n"
         "## Remote RunPod GPU Session (CRITICAL)\n"
-        f"- Active ComfyUI target: RunPod Linux container (`{pod_id}`, GPU `{gpu_name}`, ComfyUI root `/workspace/ComfyUI`), proxied through `{base_url}`.\n"
-        "- **Do NOT access the user's local computer:** NEVER download models into, install custom nodes into, read, or modify the local ComfyUI install, local `models/`, local `custom_nodes/`, or user home folders on this machine. Local `comfy model download` and `comfy node install` act on the wrong machine and MUST NOT be used.\n"
+        f"{target_line}\n"
+        "- **Local workspace exclusion rule:** Local filesystem paths on the user's machine (such as `/Users/...`, `C:\\...`, or your local `--comfy-path`) belong to the user's local Desktop app, NOT the active ComfyUI server — **NEVER** download models, install custom nodes, or mention local paths as targets. Whenever asked where models or custom nodes go, **ALWAYS** name `/workspace/ComfyUI/models/<subfolder>/...` or `/workspace/ComfyUI/custom_nodes/...` on the RunPod server.\n"
         "- **Never expose or inspect secrets:** NEVER print, echo, read, or dump secrets, API keys, tokens, `.env`, `config.json`, or environment variables (`env`, `printenv`, `$HF_TOKEN`, `$CIVITAI_API_KEY`, `$COMFYUI_BACKUP`, RunPod keys) locally or on the pod.\n"
         f"- **Use the RunPod Container Terminal bridge (`POST {base_url}/__rp_bridge/pod/exec`) for all server shell work:**\n"
         "  ```bash\n"
@@ -195,6 +216,7 @@ def sync_agent_standing_instructions(
     active_pod: Optional[dict[str, Any]],
     comfy_url: str = "http://127.0.0.1:8188",
     *,
+    clear: bool = False,
     agent_data_dir: Optional[Path] = None,
     agent_host_mod: Any = None,
 ) -> bool:
@@ -213,7 +235,7 @@ def sync_agent_standing_instructions(
 
     stripped = _AGENTS_BLOCK_RE.sub("\n", existing).strip()
 
-    if active_pod is None:
+    if clear:
         if not stripped:
             with contextlib.suppress(OSError):
                 if agents_path.exists():

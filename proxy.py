@@ -37,6 +37,7 @@ HOP_BY_HOP_HEADERS = frozenset(
 TOPBAR_SCRIPT_TAG = b'<script src="/__rp_bridge/topbar.js"></script>'
 BODY_CLOSE_RE = re.compile(rb"</body>", re.IGNORECASE)
 FEATURES_PATHS = frozenset({"/features", "/api/features"})
+SYSTEM_STATS_PATHS = frozenset({"/system_stats", "/api/system_stats"})
 DEFAULT_UPSTREAM_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -113,6 +114,29 @@ def _inject_agent_into_features_body(
         if not isinstance(data, dict):
             return None
         data["agent"] = dict(local_flag)
+        return json.dumps(data).encode("utf-8")
+    except Exception:
+        return None
+
+
+def normalize_remote_system_stats_body(
+    raw_body: bytes,
+    content_encoding: str = "",
+) -> Optional[bytes]:
+    """Ensure remote pod /system_stats reports /workspace/ComfyUI/main.py when argv[0] is relative."""
+    try:
+        decoded, ok = _decode_compressed_body(raw_body, content_encoding)
+        if not ok:
+            return None
+        data = json.loads(decoded.decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("system"), dict):
+            return None
+        sys_info = data["system"]
+        argv = sys_info.get("argv")
+        if isinstance(argv, list) and len(argv) > 0:
+            first = str(argv[0] or "").strip()
+            if first in ("main.py", "./main.py", "ComfyUI/main.py"):
+                sys_info["argv"] = ["/workspace/ComfyUI/main.py", *argv[1:]]
         return json.dumps(data).encode("utf-8")
     except Exception:
         return None
@@ -285,10 +309,11 @@ class PodProxy:
             and request.path in FEATURES_PATHS
             and local_agent_flag is not None
         )
+        is_system_stats_json = request.method == "GET" and request.path in SYSTEM_STATS_PATHS
         headers = self._build_upstream_headers(
             request,
             target_origin,
-            force_identity=(is_root_html or is_features_json),
+            force_identity=(is_root_html or is_features_json or is_system_stats_json),
         )
 
         session = await self.get_session()
@@ -384,6 +409,43 @@ class PodProxy:
                         clear_cache=clear_cache,
                     )
                     resp_headers["Cache-Control"] = "no-store"
+                    return web.Response(
+                        status=upstream_resp.status,
+                        headers=resp_headers,
+                        body=raw_body,
+                    )
+
+                if is_system_stats_json and upstream_resp.status == 200:
+                    raw_body = await upstream_resp.read()
+                    content_type = upstream_resp.headers.get("Content-Type", "").lower()
+                    content_encoding = upstream_resp.headers.get("Content-Encoding", "")
+                    modified_stats = (
+                        normalize_remote_system_stats_body(raw_body, content_encoding)
+                        if ("json" in content_type or not content_type)
+                        else None
+                    )
+                    if modified_stats is not None:
+                        resp_headers = self._build_response_headers(
+                            upstream_resp.headers,
+                            target_origin,
+                            drop_encoding=True,
+                            path=request.path,
+                            clear_cache=clear_cache,
+                        )
+                        resp_headers["Cache-Control"] = "no-store"
+                        return web.Response(
+                            status=upstream_resp.status,
+                            headers=resp_headers,
+                            body=modified_stats,
+                        )
+
+                    resp_headers = self._build_response_headers(
+                        upstream_resp.headers,
+                        target_origin,
+                        drop_encoding=False,
+                        path=request.path,
+                        clear_cache=clear_cache,
+                    )
                     return web.Response(
                         status=upstream_resp.status,
                         headers=resp_headers,

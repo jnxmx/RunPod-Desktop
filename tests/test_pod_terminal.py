@@ -130,22 +130,39 @@ class PodTerminalUnitTests(unittest.TestCase):
             self.assertNotIn("abc123xyz99", updated)
             self.assertIn("pod999new11", updated)
 
-            # Clearing restores user notes only
+            # Disconnecting (active_pod=None) switches to the generic RunPod remote block
             ok3 = agent_bridge_mod.sync_agent_standing_instructions(
                 None,
                 agent_data_dir=agent_dir,
             )
             self.assertTrue(ok3)
+            generic = agents_file.read_text(encoding="utf-8")
+            self.assertIn(user_note, generic)
+            self.assertIn(agent_bridge_mod.AGENTS_BLOCK_BEGIN, generic)
+            self.assertNotIn("pod999new11", generic)
+            self.assertIn("RunPod Remote Proxy mode", generic)
+
+            # Explicit clear=True restores user notes only
+            ok4 = agent_bridge_mod.sync_agent_standing_instructions(
+                None,
+                clear=True,
+                agent_data_dir=agent_dir,
+            )
+            self.assertTrue(ok4)
             cleared = agents_file.read_text(encoding="utf-8")
             self.assertEqual(cleared.strip(), user_note)
             self.assertNotIn(agent_bridge_mod.AGENTS_BLOCK_BEGIN, cleared)
 
-            # When no user notes exist, clearing unlinks AGENTS.md
+            # When no user notes exist, clear=True unlinks AGENTS.md
             agents_file.write_text(
                 agent_bridge_mod.build_runpod_agents_block(pod, "http://127.0.0.1:8188"),
                 encoding="utf-8",
             )
-            agent_bridge_mod.sync_agent_standing_instructions(None, agent_data_dir=agent_dir)
+            agent_bridge_mod.sync_agent_standing_instructions(
+                None,
+                clear=True,
+                agent_data_dir=agent_dir,
+            )
             self.assertFalse(agents_file.exists())
 
 
@@ -295,10 +312,13 @@ class PodTerminalBridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.decoded_commands[-1], long_cmd)
         self.assertGreaterEqual(self.received_chunk_counts[-1], 3)
 
-        # Disconnect clears managed block
+        # Disconnect removes pod-specific id while keeping the RunPod standing instructions active
         disc = await self.client.post("/__rp_bridge/disconnect", json={})
         self.assertEqual(disc.status, 200)
-        self.assertFalse(agents_path.exists())
+        self.assertTrue(agents_path.is_file())
+        post_disc_text = agents_path.read_text(encoding="utf-8")
+        self.assertNotIn("9m22ly94ns203s", post_disc_text)
+        self.assertIn("/workspace/ComfyUI", post_disc_text)
 
     async def test_prefers_http_exec_when_available_with_clean_stdout_stderr(self) -> None:
         http_app = web.Application()

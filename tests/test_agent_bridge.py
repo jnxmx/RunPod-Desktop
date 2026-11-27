@@ -129,6 +129,15 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
                 return web.json_response(payload)
             if request.path == "/api/object_info":
                 return web.json_response({"RemotePodNode": {"name": "RemotePodNode"}})
+            if request.path in ("/system_stats", "/api/system_stats"):
+                return web.json_response(
+                    {
+                        "system": {
+                            "os": "linux",
+                            "argv": ["main.py", "--fast-disk"],
+                        }
+                    }
+                )
             if request.path == "/prompt":
                 body = await request.text()
                 return web.json_response({"proxied": True, "body": body})
@@ -209,6 +218,19 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
         wf_sub = web.Application()
         wf_sub.router.add_route("*", "/{tail:.*}", local_agent_http)
         local_app.add_subapp("/api/workflows", wf_sub)
+
+        async def local_system_stats(_request: web.Request) -> web.Response:
+            return web.json_response(
+                {
+                    "system": {
+                        "os": "darwin",
+                        "argv": ["/Users/jnx/Local/ComfyUI/main.py", "--enable-agent"],
+                    }
+                }
+            )
+
+        local_app.router.add_get("/system_stats", local_system_stats)
+        local_app.router.add_get("/api/system_stats", local_system_stats)
 
         self.local_server = TestServer(local_app)
         self.client = TestClient(self.local_server)
@@ -375,15 +397,57 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await ref_res.json(), {"ok": True, "refreshed": True})
             self.assertEqual(len(handle.stop_calls), 2)
 
-            # Restart budget guard blocks stop when restarts >= max_restarts - 1
+            # Restart budget guard allows restarts < max_restarts and blocks restarts >= max_restarts
             host._status = {"state": "ready", "restarts": 2, "max_restarts": 3}
             handle.returncode = None
-            guarded = await refresher.refresh_for_pod("podB5678", force=False)
+            allowed = await refresher.refresh_for_pod("podB5678", force=False)
+            self.assertEqual(allowed, {"ok": True, "refreshed": True})
+            self.assertEqual(len(handle.stop_calls), 3)
+
+            host._status = {"state": "ready", "restarts": 3, "max_restarts": 3}
+            handle.returncode = None
+            guarded = await refresher.refresh_for_pod("podC9012", force=False)
             self.assertEqual(guarded, {"ok": False, "refreshed": False, "reason": "restart_budget_low"})
-            self.assertEqual(len(handle.stop_calls), 2)
+            self.assertEqual(len(handle.stop_calls), 3)
         finally:
             await client.close()
             await api.client.close()
+
+    async def test_starting_state_waits_and_then_refreshes(self) -> None:
+        handle = _FakeHandle()
+        host = _FakeAgentHost({"state": "starting", "restarts": 0, "max_restarts": 3}, handle)
+        mod = _FakeAgentHostModule(host)
+        refresher = agent_bridge.LocalAgentCatalogRefresher(agent_host_getter=lambda: mod)
+
+        async def _mark_ready() -> None:
+            await asyncio.sleep(0.35)
+            host._status["state"] = "ready"
+
+        t = asyncio.create_task(_mark_ready())
+        res = await refresher.refresh_for_pod("podWait123", force=False)
+        await t
+        self.assertEqual(res, {"ok": True, "refreshed": True})
+        self.assertEqual(len(handle.stop_calls), 1)
+
+    async def test_system_stats_normalized_in_remote_and_untouched_in_deployer(self) -> None:
+        # Remote mode normalizes relative "main.py" while keeping flags like --fast-disk
+        remote_resp = await self.client.get("/system_stats")
+        self.assertEqual(remote_resp.status, 200)
+        remote_data = await remote_resp.json()
+        self.assertEqual(remote_data["system"]["argv"], ["/workspace/ComfyUI/main.py", "--fast-disk"])
+
+        # Disconnect to deployer mode: local /system_stats passes through untouched
+        disc = await self.client.post("/__rp_bridge/disconnect", json={})
+        self.assertEqual(disc.status, 200)
+
+        local_resp = await self.client.get("/api/system_stats")
+        self.assertEqual(local_resp.status, 200)
+        local_data = await local_resp.json()
+        self.assertEqual(local_data["system"]["os"], "darwin")
+        self.assertEqual(
+            local_data["system"]["argv"],
+            ["/Users/jnx/Local/ComfyUI/main.py", "--enable-agent"],
+        )
 
 
 if __name__ == "__main__":
