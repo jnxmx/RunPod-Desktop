@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
+from .agent_bridge import sync_agent_standing_instructions
 from .config import (
     CONFIG_PATH,
     clear_api_key,
@@ -21,6 +22,7 @@ from .config import (
     save_config,
     set_api_key,
 )
+from .pod_terminal import PodTerminalExecutor, is_loopback_bridge_request
 from .runpod_client import RunPodClient, is_valid_pod_id
 from .updater import PluginUpdater
 
@@ -48,12 +50,16 @@ class BridgeAPI:
         url_opener: Callable[[str], bool] = webbrowser.open,
         agent_refresher: Optional[Callable[[str, bool], Awaitable[dict[str, Any]]]] = None,
         updater: Optional[PluginUpdater] = None,
+        pod_executor: Optional[PodTerminalExecutor] = None,
+        agent_data_dir: Optional[Path] = None,
     ) -> None:
         self.client = runpod_client or RunPodClient()
         self.config_path = config_path
         self.url_opener = url_opener
         self._agent_refresher = agent_refresher
         self.updater = updater or PluginUpdater()
+        self.pod_executor = pod_executor or PodTerminalExecutor()
+        self._agent_data_dir = agent_data_dir
         cfg = load_config(self.config_path)
         self.state = BridgeState(
             mode="deployer",
@@ -62,6 +68,21 @@ class BridgeAPI:
         )
         self._pods_summary_cache_ts: float = 0.0
         self._pods_summary_cache_data: Optional[dict[str, Any]] = None
+        self._sync_agent_instructions(None)
+
+    def _sync_agent_instructions(
+        self,
+        active_pod: Optional[dict[str, Any]],
+        comfy_url: str = "http://127.0.0.1:8188",
+    ) -> None:
+        try:
+            sync_agent_standing_instructions(
+                active_pod,
+                comfy_url,
+                agent_data_dir=self._agent_data_dir,
+            )
+        except Exception:
+            pass
 
     def consume_clear_cache_flag(self) -> bool:
         """Return and clear the one-shot Clear-Site-Data cache flag."""
@@ -101,6 +122,14 @@ class BridgeAPI:
             pod_id = path[len("/__rp_bridge/pod_health/"):]
             return await self._handle_pod_health(pod_id)
 
+        if (
+            path.startswith("/__rp_bridge/pods/")
+            and path.endswith("/logs_ws")
+            and method == "GET"
+        ):
+            pod_id = path[len("/__rp_bridge/pods/"):-len("/logs_ws")].strip("/")
+            return await self._handle_pod_logs_ws(request, pod_id)
+
         if path == "/__rp_bridge/connect" and method == "POST":
             return await self._handle_connect(request)
 
@@ -112,6 +141,9 @@ class BridgeAPI:
 
         if path == "/__rp_bridge/pod/restart" and method == "POST":
             return await self._handle_pod_restart(request)
+
+        if path == "/__rp_bridge/pod/exec" and method == "POST":
+            return await self._handle_pod_exec(request)
 
         if path == "/__rp_bridge/open_url" and method == "POST":
             return await self._handle_open_url(request)
@@ -290,6 +322,50 @@ class BridgeAPI:
         status, data = await self.client.check_pod_health(pod_id)
         return web.json_response(data, status=status, headers={"Cache-Control": "no-store"})
 
+    async def _handle_pod_logs_ws(self, request: web.Request, pod_id: str) -> web.StreamResponse:
+        denied = self._require_deployer_mode()
+        if denied is not None:
+            return denied
+
+        api_key = get_api_key(self.config_path)
+        return await self.client.stream_pod_logs_ws(request, pod_id, api_key)
+
+    async def _handle_pod_exec(self, request: web.Request) -> web.Response:
+        if not is_loopback_bridge_request(request):
+            return web.json_response({"ok": False, "error": "Loopback access only."}, status=403)
+
+        pod_id = str((self.state.active_pod or {}).get("podId") or "").strip()
+        if self.state.mode != "remote" or not is_valid_pod_id(pod_id):
+            return web.json_response({"ok": False, "error": "No active RunPod pod connected."}, status=400)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Invalid payload."}, status=400)
+
+        command = body.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return web.json_response({"ok": False, "error": "Field 'command' must be a non-empty string."}, status=400)
+
+        cwd_raw = body.get("cwd")
+        cwd = cwd_raw.strip() if isinstance(cwd_raw, str) and cwd_raw.strip() else "/workspace/ComfyUI"
+        timeout_raw = body.get("timeout", 600.0)
+        try:
+            timeout_s = float(timeout_raw) if timeout_raw is not None else 600.0
+        except (TypeError, ValueError):
+            timeout_s = 600.0
+
+        result = await self.pod_executor.execute(
+            pod_id,
+            command,
+            cwd=cwd,
+            timeout_s=timeout_s,
+            extra_secrets=[get_api_key(self.config_path)],
+        )
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
     async def _handle_connect(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -345,6 +421,8 @@ class BridgeAPI:
         self._pods_summary_cache_ts = 0.0
         self._pods_summary_cache_data = None
         save_config({"active_pod": active_pod}, self.config_path)
+        port = request.url.port or 8188
+        self._sync_agent_instructions(active_pod, f"http://127.0.0.1:{port}")
         if self._agent_refresher is not None:
             asyncio.create_task(self._safe_refresh_agent(pod_id, force=False))
         return web.json_response({"ok": True, "mode": "remote", "activePod": active_pod})
@@ -354,6 +432,7 @@ class BridgeAPI:
         self.state.clear_cache_next = True
         self._pods_summary_cache_ts = 0.0
         self._pods_summary_cache_data = None
+        self._sync_agent_instructions(None)
         return web.json_response({"ok": True, "mode": "deployer"})
 
     async def _handle_pod_terminate(self, _request: web.Request) -> web.Response:
@@ -364,6 +443,7 @@ class BridgeAPI:
             self.state.clear_cache_next = True
             self._pods_summary_cache_ts = 0.0
             self._pods_summary_cache_data = None
+            self._sync_agent_instructions(None)
             return web.json_response({"ok": False, "error": "Нет активного пода."}, status=400)
 
         api_key = get_api_key(self.config_path)
@@ -375,6 +455,7 @@ class BridgeAPI:
             self._pods_summary_cache_ts = 0.0
             self._pods_summary_cache_data = None
             save_config({"active_pod": None}, self.config_path)
+            self._sync_agent_instructions(None)
         return web.json_response(result, status=status)
 
     async def _handle_pods_summary(self, _request: web.Request) -> web.Response:

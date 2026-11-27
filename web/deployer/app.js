@@ -147,14 +147,20 @@ const state = {
 
 async function openExternalUrl(url) {
   if (!url) return;
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 2500) : null;
   try {
     const res = await fetch(`${BRIDGE_BASE}/open_url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url })
+      body: JSON.stringify({ url }),
+      signal: controller?.signal
     });
     if (res.ok) return;
-  } catch {}
+  } catch {
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
@@ -1916,6 +1922,7 @@ function getOrCreatePodController(podId, initData = {}) {
       alert: null,
       logLines: [],
       logAbortController: null,
+      logSocket: null,
       logRetryTimerId: null,
       logsUserToggled: false,
       logsAutoCollapsed: false,
@@ -1938,14 +1945,7 @@ function stopPodController(ctrl) {
     clearInterval(ctrl.pollTimerId);
     ctrl.pollTimerId = null;
   }
-  if (ctrl.logRetryTimerId) {
-    clearTimeout(ctrl.logRetryTimerId);
-    ctrl.logRetryTimerId = null;
-  }
-  if (ctrl.logAbortController) {
-    ctrl.logAbortController.abort();
-    ctrl.logAbortController = null;
-  }
+  stopLogStreamForPod(ctrl);
 }
 
 async function fetchActivePods() {
@@ -2012,7 +2012,7 @@ async function fetchActivePods() {
         syncPodStateFromApi(ctrl, pod);
       }
 
-      if (!state.logStreamsPausedForUpdate && (ctrl.isOurPod || ctrl.isExpanded) && !ctrl.logAbortController) {
+      if (!state.logStreamsPausedForUpdate && (ctrl.isOurPod || ctrl.isExpanded) && !isLogStreamActive(ctrl)) {
         startLogStreamForPod(ctrl);
       }
 
@@ -2665,11 +2665,26 @@ function updatePodCardElement(ctrl, cardEl) {
   }
 }
 
+function isLogStreamActive(ctrl) {
+  return Boolean(ctrl && (ctrl.logAbortController || ctrl.logSocket));
+}
+
 function stopLogStreamForPod(ctrl) {
   if (!ctrl) return;
   if (ctrl.logRetryTimerId) {
     clearTimeout(ctrl.logRetryTimerId);
     ctrl.logRetryTimerId = null;
+  }
+  if (ctrl.logSocket) {
+    const sock = ctrl.logSocket;
+    ctrl.logSocket = null;
+    try {
+      sock.onopen = null;
+      sock.onmessage = null;
+      sock.onerror = null;
+      sock.onclose = null;
+      sock.close();
+    } catch {}
   }
   if (ctrl.logAbortController) {
     ctrl.logAbortController.abort();
@@ -2687,7 +2702,7 @@ function pauseAllPodLogStreams() {
 function resumePodLogStreams() {
   state.logStreamsPausedForUpdate = false;
   for (const ctrl of state.podControllers.values()) {
-    if ((ctrl.isOurPod || ctrl.isExpanded) && !ctrl.logAbortController) {
+    if ((ctrl.isOurPod || ctrl.isExpanded) && !isLogStreamActive(ctrl)) {
       startLogStreamForPod(ctrl);
     }
   }
@@ -2698,7 +2713,7 @@ function togglePodExpanded(ctrl, cardEl) {
   cardEl.classList.toggle("is-expanded", ctrl.isExpanded);
 
   if (ctrl.isExpanded) {
-    if (!state.logStreamsPausedForUpdate && !ctrl.logAbortController) startLogStreamForPod(ctrl);
+    if (!state.logStreamsPausedForUpdate && !isLogStreamActive(ctrl)) startLogStreamForPod(ctrl);
     if (!ctrl.pollTimerId) {
       pollHealthForPod(ctrl);
       ctrl.pollTimerId = setInterval(() => pollHealthForPod(ctrl), 2500);
@@ -2717,7 +2732,7 @@ function scheduleLogStreamRetry(ctrl, delayMs = 3000) {
   if (state.logStreamsPausedForUpdate || !ctrl.isExpanded || !state.podControllers.has(ctrl.podId)) return;
   ctrl.logRetryTimerId = setTimeout(() => {
     ctrl.logRetryTimerId = null;
-    if (!state.logStreamsPausedForUpdate && ctrl.isExpanded && state.podControllers.has(ctrl.podId) && !ctrl.logAbortController) {
+    if (!state.logStreamsPausedForUpdate && ctrl.isExpanded && state.podControllers.has(ctrl.podId) && !isLogStreamActive(ctrl)) {
       startLogStreamForPod(ctrl);
     }
   }, delayMs);
@@ -2730,13 +2745,125 @@ function setLogPlaceholderMessage(ctrl, message) {
   if (logPre) logPre.textContent = message;
 }
 
+function processPodLogTextChunk(ctrl, bufferState, textChunk) {
+  bufferState.buf += textChunk;
+  const lines = bufferState.buf.split("\n");
+  bufferState.buf = lines.pop() || "";
+
+  let processedAny = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const jsonPart = trimmed.slice(5).trim();
+    if (!jsonPart) continue;
+    processedAny = true;
+    try {
+      handlePodLog(ctrl, JSON.parse(jsonPart), true);
+    } catch {
+      handlePodLog(ctrl, { line: jsonPart, source: "system" }, true);
+    }
+  }
+  if (processedAny) {
+    const card = document.querySelector(`.pod-card[data-pod-id="${ctrl.podId}"]`);
+    const logPre = card?.querySelector(".terminal-logs");
+    if (logPre) {
+      logPre.textContent = ctrl.logLines.join("\n");
+      logPre.scrollTop = logPre.scrollHeight;
+    }
+    if (card) updatePodCardElement(ctrl, card);
+  }
+}
+
+function startLogStreamViaWebSocket(ctrl) {
+  if (typeof WebSocket === "undefined") return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsProto}//${window.location.host}${BRIDGE_BASE}/pods/${encodeURIComponent(ctrl.podId)}/logs_ws?tail=200`;
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    ctrl.logSocket = ws;
+    let opened = false;
+    let retryDelayMs = 3000;
+    const bufferState = { buf: "" };
+
+    ws.onopen = () => {
+      opened = true;
+      resolve(true);
+    };
+
+    ws.onmessage = (event) => {
+      if (ctrl.logSocket !== ws) return;
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.type === "ready") {
+        clearApiKeyPermissionError("Логи подов (/pods/{id}/logs)");
+        ctrl.logLines = [];
+        return;
+      }
+      if (msg.type === "chunk" && typeof msg.data === "string") {
+        processPodLogTextChunk(ctrl, bufferState, msg.data);
+        return;
+      }
+      if (msg.type === "error") {
+        const status = Number(msg.status || 0);
+        if (state.isTransitioningToPod) return;
+        if (status === 401 || status === 403) {
+          setApiKeyPermissionError("Логи подов (/pods/{id}/logs)", status);
+          retryDelayMs = 10000;
+          setLogPlaceholderMessage(
+            ctrl,
+            `[HTTP ${status}] Нет доступа к логам пода ${ctrl.podId}. Проверьте права API-ключа RunPod (Pods: Read & Write и GraphQL: Read only).\n`
+          );
+        } else {
+          retryDelayMs = 2500;
+          setLogPlaceholderMessage(
+            ctrl,
+            `Подключение к логам пода ${ctrl.podId}... (HTTP ${status || "error"}, повтор через 2.5с)\n`
+          );
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      if (!opened && ctrl.logSocket === ws) {
+        ctrl.logSocket = null;
+        resolve(false);
+      }
+    };
+
+    ws.onclose = () => {
+      if (ctrl.logSocket === ws) {
+        ctrl.logSocket = null;
+      }
+      if (!opened) {
+        resolve(false);
+        return;
+      }
+      if (!state.isTransitioningToPod && !state.logStreamsPausedForUpdate && state.podControllers.has(ctrl.podId)) {
+        scheduleLogStreamRetry(ctrl, retryDelayMs);
+      }
+    };
+  });
+}
+
 async function startLogStreamForPod(ctrl) {
   if (state.logStreamsPausedForUpdate) return;
-  if (ctrl.logRetryTimerId) {
-    clearTimeout(ctrl.logRetryTimerId);
-    ctrl.logRetryTimerId = null;
-  }
-  if (ctrl.logAbortController) ctrl.logAbortController.abort();
+  stopLogStreamForPod(ctrl);
+
+  // Prefer WebSocket so unlimited pod log streams never consume Chromium's 6 HTTP/1.1 fetch slots.
+  const wsStarted = await startLogStreamViaWebSocket(ctrl);
+  if (wsStarted || state.logStreamsPausedForUpdate) return;
+
   const abortController = new AbortController();
   ctrl.logAbortController = abortController;
 
@@ -2773,7 +2900,7 @@ async function startLogStreamForPod(ctrl) {
     ctrl.logLines = [];
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "";
+    const bufferState = { buf: "" };
 
     while (true) {
       const { value, done } = await reader.read();
@@ -2781,32 +2908,7 @@ async function startLogStreamForPod(ctrl) {
         shouldRetry = true;
         break;
       }
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      let processedAny = false;
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const jsonPart = trimmed.slice(5).trim();
-        if (!jsonPart) continue;
-        processedAny = true;
-        try {
-          handlePodLog(ctrl, JSON.parse(jsonPart), true);
-        } catch {
-          handlePodLog(ctrl, { line: jsonPart, source: "system" }, true);
-        }
-      }
-      if (processedAny) {
-        const card = document.querySelector(`.pod-card[data-pod-id="${ctrl.podId}"]`);
-        const logPre = card?.querySelector(".terminal-logs");
-        if (logPre) {
-          logPre.textContent = ctrl.logLines.join("\n");
-          logPre.scrollTop = logPre.scrollHeight;
-        }
-        if (card) updatePodCardElement(ctrl, card);
-      }
+      processPodLogTextChunk(ctrl, bufferState, decoder.decode(value, { stream: true }));
     }
   } catch (err) {
     if (err.name !== "AbortError" && !state.isTransitioningToPod) {

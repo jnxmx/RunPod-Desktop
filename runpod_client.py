@@ -438,6 +438,76 @@ class RunPodClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             return web.json_response({"error": f"Ошибка сети RunPod API: {exc}"}, status=502)
 
+    async def stream_pod_logs_ws(
+        self,
+        request: web.Request,
+        pod_id: str,
+        api_key: str,
+    ) -> web.WebSocketResponse:
+        """Stream RunPod pod SSE logs over a local WebSocket so HTTP/1.1 fetch slots stay free."""
+        ws = web.WebSocketResponse(heartbeat=25.0)
+        await ws.prepare(request)
+
+        if not is_valid_pod_id(pod_id):
+            await ws.send_json({"type": "error", "status": 400})
+            await ws.close()
+            return ws
+
+        if not api_key:
+            await ws.send_json({"type": "error", "status": 401})
+            await ws.close()
+            return ws
+
+        tail = request.query.get("tail", "200")
+        target_url = f"{self.rest_base}/pods/{pod_id}/logs?tail={tail}"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream",
+        }
+        timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=None)
+        session = await self.get_session()
+
+        async def _watch_client_close() -> None:
+            async for _msg in ws:
+                pass
+
+        async def _pump_upstream() -> None:
+            try:
+                async with session.get(target_url, headers=headers, timeout=timeout) as upstream_resp:
+                    if upstream_resp.status != 200:
+                        if not ws.closed:
+                            await ws.send_json({"type": "error", "status": upstream_resp.status})
+                        return
+                    if not ws.closed:
+                        await ws.send_json({"type": "ready"})
+                    async for chunk in upstream_resp.content.iter_any():
+                        if ws.closed:
+                            break
+                        if not chunk:
+                            continue
+                        await ws.send_json(
+                            {"type": "chunk", "data": chunk.decode("utf-8", errors="replace")}
+                        )
+            except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError):
+                if not ws.closed:
+                    await ws.send_json({"type": "error", "status": 502})
+
+        pump_task = asyncio.create_task(_pump_upstream())
+        watch_task = asyncio.create_task(_watch_client_close())
+        try:
+            _, pending = await asyncio.wait(
+                {pump_task, watch_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            if not ws.closed:
+                await ws.close()
+        return ws
+
     async def check_pod_health(self, pod_id: str) -> tuple[int, dict]:
         """Check whether the ComfyUI server on port 7860 of a pod is responding."""
         if not is_valid_pod_id(pod_id):
