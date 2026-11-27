@@ -37,7 +37,7 @@ def _read_plugin_version() -> str:
             return match.group(1).strip()
     except OSError:
         pass
-    return "0.1.3"
+    return "0.1.4"
 
 
 PLUGIN_VERSION = _read_plugin_version()
