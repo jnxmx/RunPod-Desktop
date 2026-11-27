@@ -135,14 +135,14 @@ class UpdaterBridgeHttpTests(unittest.IsolatedAsyncioTestCase):
         self.fail_next_fetch = False
         self.versions_payload: list[dict[str, Any]] = [
             {
-                "version": "0.1.1",
+                "version": "0.1.2",
                 "status": "NodeVersionStatusActive",
-                "downloadUrl": "https://cdn.comfy.org/jnx/comfyui-runpod-desktop/0.1.1/node.zip",
+                "downloadUrl": "https://cdn.comfy.org/jnx/comfyui-runpod-desktop/0.1.2/node.zip",
             },
             {
-                "version": "0.1.2-nightly.1",
+                "version": "9.9.9-nightly.1",
                 "status": "NodeVersionStatusPending",
-                "downloadUrl": "https://cdn.comfy.org/jnx/comfyui-runpod-desktop/0.1.2-nightly.1/node.zip",
+                "downloadUrl": "https://cdn.comfy.org/jnx/comfyui-runpod-desktop/9.9.9-nightly.1/node.zip",
                 "createdAt": "2026-11-26T22:15:00Z",
                 "changelog": "Hotfix build",
             },
@@ -176,7 +176,7 @@ class UpdaterBridgeHttpTests(unittest.IsolatedAsyncioTestCase):
         data1 = await res1.json()
         self.assertTrue(data1["ok"])
         self.assertTrue(data1["updateAvailable"])
-        self.assertEqual(data1["latestVersion"], "0.1.2-nightly.1")
+        self.assertEqual(data1["latestVersion"], "9.9.9-nightly.1")
         self.assertEqual(data1["latestStatus"], "NodeVersionStatusPending")
         self.assertTrue(data1["isPrerelease"])
         self.assertEqual(self.fetch_calls, 1)
@@ -185,7 +185,7 @@ class UpdaterBridgeHttpTests(unittest.IsolatedAsyncioTestCase):
         res2 = await self.client.get("/__rp_bridge/plugin_update")
         self.assertEqual(res2.status, 200)
         data2 = await res2.json()
-        self.assertEqual(data2["latestVersion"], "0.1.2-nightly.1")
+        self.assertEqual(data2["latestVersion"], "9.9.9-nightly.1")
         self.assertEqual(self.fetch_calls, 1)
 
         # ?force=1 bypasses cache

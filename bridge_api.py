@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import webbrowser
 from dataclasses import dataclass
@@ -26,7 +27,20 @@ from .pod_terminal import PodTerminalExecutor, is_loopback_bridge_request
 from .runpod_client import RunPodClient, is_valid_pod_id
 from .updater import PluginUpdater
 
-PLUGIN_VERSION = "0.1.1"
+def _read_plugin_version() -> str:
+    """Read package version from pyproject.toml so runtime and CNR metadata stay in sync."""
+    pyproject = Path(__file__).resolve().parent / "pyproject.toml"
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+        match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+        if match:
+            return match.group(1).strip()
+    except OSError:
+        pass
+    return "0.1.2"
+
+
+PLUGIN_VERSION = _read_plugin_version()
 WEB_DIR = Path(__file__).resolve().parent / "web"
 DEPLOYER_DIR = WEB_DIR / "deployer"
 
