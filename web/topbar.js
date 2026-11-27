@@ -832,12 +832,12 @@
     if (activePodId && document.visibilityState !== "hidden") {
       refreshPodsSummary();
     }
-  }, 60000);
+  }, 120000);
   document.addEventListener("visibilitychange", () => {
     if (
       activePodId &&
       document.visibilityState !== "hidden" &&
-      Date.now() - lastPodsSummaryFetchMs >= 60000
+      Date.now() - lastPodsSummaryFetchMs >= 120000
     ) {
       refreshPodsSummary();
     }

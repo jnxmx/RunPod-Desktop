@@ -37,7 +37,7 @@ def _read_plugin_version() -> str:
             return match.group(1).strip()
     except OSError:
         pass
-    return "0.1.2"
+    return "0.1.3"
 
 
 PLUGIN_VERSION = _read_plugin_version()
@@ -83,6 +83,10 @@ class BridgeAPI:
         )
         self._pods_summary_cache_ts: float = 0.0
         self._pods_summary_cache_data: Optional[dict[str, Any]] = None
+        self._pods_summary_backoff_until: float = 0.0
+        self._key_meta_cache_key: str = ""
+        self._key_meta_cache_ts: float = 0.0
+        self._key_meta_cache_data: Optional[dict[str, Any]] = None
         self._sync_agent_instructions(self.state.active_pod, self._local_comfy_url)
 
     def _sync_agent_instructions(
@@ -266,12 +270,18 @@ class BridgeAPI:
 
         if body.get("clearApiKey") is True:
             clear_api_key(self.config_path)
+            self._key_meta_cache_key = ""
+            self._key_meta_cache_ts = 0.0
+            self._key_meta_cache_data = None
         elif isinstance(body.get("apiKey"), str):
             entered = body["apiKey"].strip()
             if entered:
                 set_api_key(entered, self.config_path)
             else:
                 clear_api_key(self.config_path)
+            self._key_meta_cache_key = ""
+            self._key_meta_cache_ts = 0.0
+            self._key_meta_cache_data = None
 
         if "customTemplateId" in body:
             tpl = body.get("customTemplateId")
@@ -313,10 +323,22 @@ class BridgeAPI:
             return denied
 
         api_key = get_api_key(self.config_path)
-        (status, data), key_meta = await asyncio.gather(
-            self.client.fetch_balance(api_key),
-            self.client.fetch_api_key_metadata(api_key),
+        now = time.monotonic()
+        need_key_meta = bool(api_key) and (
+            api_key != self._key_meta_cache_key or (now - self._key_meta_cache_ts) >= 600.0
         )
+        if need_key_meta:
+            (status, data), key_meta = await asyncio.gather(
+                self.client.fetch_balance(api_key),
+                self.client.fetch_api_key_metadata(api_key),
+            )
+            if key_meta is not None:
+                self._key_meta_cache_key = api_key
+                self._key_meta_cache_ts = time.monotonic()
+                self._key_meta_cache_data = key_meta
+        else:
+            status, data = await self.client.fetch_balance(api_key)
+            key_meta = self._key_meta_cache_data if api_key == self._key_meta_cache_key else None
         if status == 200 and isinstance(data, dict) and key_meta is not None:
             data["keyInfo"] = key_meta
         return web.json_response(data, status=status, headers={"Cache-Control": "no-store"})
@@ -478,17 +500,27 @@ class BridgeAPI:
         now = time.monotonic()
         if (
             self._pods_summary_cache_data is not None
-            and (now - self._pods_summary_cache_ts) < 15.0
+            and (now - self._pods_summary_cache_ts) < 55.0
         ):
             return web.json_response(
                 self._pods_summary_cache_data,
                 headers={"Cache-Control": "no-store"},
             )
 
-        api_key = get_api_key(self.config_path)
         active = self.state.active_pod
-        active_pod_id = str((active or {}).get("podId") or "").strip()
-        summary = await self.client.fetch_active_pods_summary(api_key, active_pod_id=active_pod_id)
+        if now < self._pods_summary_backoff_until:
+            if self._pods_summary_cache_data is not None:
+                return web.json_response(
+                    self._pods_summary_cache_data,
+                    headers={"Cache-Control": "no-store"},
+                )
+            summary = None
+        else:
+            api_key = get_api_key(self.config_path)
+            active_pod_id = str((active or {}).get("podId") or "").strip()
+            summary = await self.client.fetch_active_pods_summary(api_key, active_pod_id=active_pod_id)
+            if summary is None and getattr(self.client, "last_pods_summary_status", 0) == 429:
+                self._pods_summary_backoff_until = time.monotonic() + 120.0
 
         if summary is None:
             fallback_count = 1 if isinstance(active, dict) else 0

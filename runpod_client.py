@@ -87,6 +87,7 @@ class RunPodClient:
         self.rest_base = rest_base.rstrip("/")
         self.graphql_url = graphql_url
         self._session: Optional[aiohttp.ClientSession] = None
+        self.last_pods_summary_status: int = 0
 
     async def get_session(self) -> aiohttp.ClientSession:
         """Lazily create a shared aiohttp ClientSession on the active event loop."""
@@ -589,6 +590,7 @@ class RunPodClient:
             return None
 
         status, data = await self._probe_rest_get(api_key, "pods?limit=100")
+        self.last_pods_summary_status = status
         if status != 200 or data is None:
             return None
 
