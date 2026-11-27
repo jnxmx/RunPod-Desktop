@@ -472,9 +472,23 @@
                 <tr>
                   <th scope="col" class="col-check" aria-label="Выбор"></th>
                   <th scope="col" class="col-name">Видеокарта</th>
-                  <th scope="col" class="col-price">Цена</th>
-                  <th scope="col" class="col-power">
-                    <a href="https://course.yakushev.fr/gpu_score/" target="_blank" rel="noopener noreferrer" class="th-score-link" title="Открыть таблицу замеров скоростей на RunPod">Скорость</a>
+                  <th scope="col" class="col-price" aria-sort="none">
+                    <button type="button" id="sort-price-btn" class="th-sort-btn" title="Сортировать по цене">
+                      <span>Цена</span>
+                      <svg class="th-sort-arrow" viewBox="0 0 10 6" width="8" height="5" aria-hidden="true">
+                        <path d="M1 1h8L5 5.5Z" fill="currentColor" />
+                      </svg>
+                    </button>
+                  </th>
+                  <th scope="col" class="col-power" aria-sort="descending">
+                    <div class="th-power-wrap">
+                      <a href="https://course.yakushev.fr/gpu_score/" target="_blank" rel="noopener noreferrer" class="th-score-link" title="Открыть таблицу замеров скоростей на RunPod">Скорость</a>
+                      <button type="button" id="sort-power-btn" class="th-sort-btn th-sort-icon-btn is-active" title="Сортировать по скорости" aria-label="Сортировать по скорости">
+                        <svg class="th-sort-arrow" viewBox="0 0 10 6" width="8" height="5" aria-hidden="true">
+                          <path d="M1 1h8L5 5.5Z" fill="currentColor" />
+                        </svg>
+                      </button>
+                    </div>
                   </th>
                   <th scope="col" class="col-action" aria-label="Действие"></th>
                 </tr>
@@ -559,7 +573,10 @@
     </div>
   </div>
 
-  <a href="https://course.yakushev.fr/" target="_blank" rel="noopener noreferrer" class="desktop-corner-link">course.yakushev.fr</a>
+  <div class="desktop-corner-bar">
+    <a href="https://course.yakushev.fr/" target="_blank" rel="noopener noreferrer" class="desktop-corner-link">course.yakushev.fr</a>
+    <button type="button" id="plugin-update-btn" class="plugin-update-pill" hidden title="Проверить обновления плагина"></button>
+  </div>
 
   <script type="module" src="/app.js"></script>
 </body>

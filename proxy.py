@@ -37,6 +37,18 @@ HOP_BY_HOP_HEADERS = frozenset(
 TOPBAR_SCRIPT_TAG = b'<script src="/__rp_bridge/topbar.js"></script>'
 BODY_CLOSE_RE = re.compile(rb"</body>", re.IGNORECASE)
 FEATURES_PATHS = frozenset({"/features", "/api/features"})
+DEFAULT_UPSTREAM_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def _normalize_upstream_user_agent(value: Optional[str]) -> str:
+    """Use a browser-like User-Agent so Cloudflare on *.proxy.runpod.net does not 403 CLI clients."""
+    ua = (value or "").strip()
+    if ua.lower().startswith("mozilla/"):
+        return ua
+    return DEFAULT_UPSTREAM_USER_AGENT
 
 
 def build_pod_http_origin(pod_id: str) -> str:
@@ -199,11 +211,14 @@ class PodProxy:
             if lk == "referer":
                 headers[k] = _rewrite_origin_or_referer(v, target_origin)
                 continue
+            if lk == "user-agent":
+                continue
             if force_identity and lk == "accept-encoding":
                 continue
             headers[k] = v
 
         headers["Host"] = target_host
+        headers["User-Agent"] = _normalize_upstream_user_agent(request.headers.get("User-Agent"))
         if force_identity:
             headers["Accept-Encoding"] = "identity"
         return headers
@@ -409,11 +424,10 @@ class PodProxy:
         ws_headers = {
             "Host": parsed_http.netloc,
             "Origin": http_origin,
+            "User-Agent": _normalize_upstream_user_agent(request.headers.get("User-Agent")),
         }
         if "Cookie" in request.headers:
             ws_headers["Cookie"] = request.headers["Cookie"]
-        if "User-Agent" in request.headers:
-            ws_headers["User-Agent"] = request.headers["User-Agent"]
 
         session = await self.get_session()
         is_comfy_main_ws = request.path == "/ws"

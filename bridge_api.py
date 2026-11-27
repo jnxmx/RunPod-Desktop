@@ -22,6 +22,7 @@ from .config import (
     set_api_key,
 )
 from .runpod_client import RunPodClient, is_valid_pod_id
+from .updater import PluginUpdater
 
 PLUGIN_VERSION = "0.1.1"
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -46,11 +47,13 @@ class BridgeAPI:
         config_path: Path = CONFIG_PATH,
         url_opener: Callable[[str], bool] = webbrowser.open,
         agent_refresher: Optional[Callable[[str, bool], Awaitable[dict[str, Any]]]] = None,
+        updater: Optional[PluginUpdater] = None,
     ) -> None:
         self.client = runpod_client or RunPodClient()
         self.config_path = config_path
         self.url_opener = url_opener
         self._agent_refresher = agent_refresher
+        self.updater = updater or PluginUpdater()
         cfg = load_config(self.config_path)
         self.state = BridgeState(
             mode="deployer",
@@ -74,6 +77,9 @@ class BridgeAPI:
 
         if path == "/__rp_bridge/status" and method == "GET":
             return await self._handle_status(request)
+
+        if path == "/__rp_bridge/plugin_update" and method == "GET":
+            return await self._handle_plugin_update(request)
 
         if path == "/__rp_bridge/pods_summary" and method == "GET":
             return await self._handle_pods_summary(request)
@@ -189,6 +195,15 @@ class BridgeAPI:
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    async def _handle_plugin_update(self, request: web.Request) -> web.Response:
+        denied = self._require_deployer_mode()
+        if denied is not None:
+            return denied
+
+        force = str(request.query.get("force") or "").strip().lower() in ("1", "true", "yes")
+        data = await self.updater.check_for_updates(PLUGIN_VERSION, force=force)
+        return web.json_response(data, headers={"Cache-Control": "no-store"})
 
     async def _handle_config(self, request: web.Request) -> web.Response:
         denied = self._require_deployer_mode()

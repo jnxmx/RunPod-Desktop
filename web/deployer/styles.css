@@ -1591,9 +1591,13 @@ a:focus-visible {
 .logs-details[open] .logs-caret {
   transform: rotate(0deg);
 }
+.terminal-logs-wrap {
+  position: relative;
+  margin-top: 6px;
+}
 .terminal-logs {
-  margin: 6px 0 0;
-  padding: 12px 14px;
+  margin: 0;
+  padding: 12px 38px 12px 14px;
   border-radius: 10px;
   background-color: rgba(255, 255, 255, 0.04);
   background-color: color-mix(in oklch, oklch(0.955 0 0) 4%, transparent);
@@ -1606,6 +1610,34 @@ a:focus-visible {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.btn-copy-logs {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background-color: rgba(24, 24, 27, 0.78);
+  color: rgba(255, 255, 255, 0.58);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color 0.14s ease, border-color 0.14s ease, background-color 0.14s ease;
+}
+.btn-copy-logs:hover {
+  color: #f5f5f7;
+  border-color: rgba(255, 255, 255, 0.2);
+  background-color: rgba(39, 39, 42, 0.92);
+}
+.btn-copy-logs.is-copied {
+  color: var(--success);
+  border-color: var(--success-border);
+  background-color: var(--success-bg);
 }
 
 .pod-held-retry-box {
@@ -2471,6 +2503,47 @@ tr.row-exceeds-price td {
 .th-score-link:hover {
   color: var(--text-primary);
 }
+.th-power-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.th-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.th-sort-icon-btn {
+  padding: 2px;
+}
+.th-sort-btn:hover {
+  color: var(--text-primary);
+}
+.th-sort-arrow {
+  display: block;
+  flex-shrink: 0;
+  color: var(--subtle-foreground);
+  opacity: 0.7;
+  transition: color 0.14s ease, opacity 0.14s ease, transform 0.14s ease;
+}
+.th-sort-btn.is-active .th-sort-arrow {
+  color: #ffffff;
+  opacity: 1;
+}
+.th-sort-btn.is-active.is-asc .th-sort-arrow {
+  transform: rotate(180deg);
+}
 
 .gpu-broken-warn {
   display: inline-flex;
@@ -2882,11 +2955,17 @@ tr.row-exceeds-price td {
   display: none !important;
 }
 
-.desktop-corner-link {
+.desktop-corner-bar {
   position: fixed;
   left: 16px;
   bottom: 12px;
   z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.desktop-corner-link {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.42);
   text-decoration: none;
@@ -2895,4 +2974,71 @@ tr.row-exceeds-price td {
 
 .desktop-corner-link:hover {
   color: rgba(255, 255, 255, 0.85);
+}
+
+.plugin-update-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background-color: rgba(255, 255, 255, 0.03);
+  color: rgba(255, 255, 255, 0.52);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.14s ease, border-color 0.14s ease, background-color 0.14s ease;
+}
+.plugin-update-pill[hidden] {
+  display: none;
+}
+.plugin-update-pill:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background-color: rgba(255, 255, 255, 0.07);
+}
+.plugin-update-pill:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+.plugin-update-pill.is-available {
+  color: var(--warn);
+  border-color: var(--warn-border);
+  background-color: var(--warn-bg);
+}
+.plugin-update-pill.is-available:hover:not(:disabled) {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.5);
+  background-color: rgba(245, 158, 11, 0.18);
+}
+.plugin-update-pill.is-updating {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background-color: rgba(255, 255, 255, 0.06);
+  cursor: progress;
+}
+.plugin-update-pill.is-reboot {
+  color: var(--success);
+  border-color: var(--success-border);
+  background-color: var(--success-bg);
+}
+.plugin-update-pill.is-reboot:hover:not(:disabled) {
+  color: #86efac;
+  border-color: rgba(89, 211, 140, 0.48);
+  background-color: rgba(89, 211, 140, 0.22);
+}
+.plugin-update-pill.is-error {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background-color: var(--danger-bg);
+}
+.plugin-update-pill .loading-spinner {
+  width: 11px;
+  height: 11px;
+  border-width: 1.5px;
 }

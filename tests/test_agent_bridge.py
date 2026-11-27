@@ -99,6 +99,7 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
         self._tmp_dir = tempfile.TemporaryDirectory()
         self.config_path = Path(self._tmp_dir.name) / "config.json"
         self.upstream_requests: list[tuple[str, str]] = []
+        self.upstream_user_agents: list[str] = []
         self.upstream_ws_paths: list[str] = []
         self.upstream_features_mode = "missing_agent"
         self.upstream_features_gzip = False
@@ -111,6 +112,7 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         async def upstream_http(request: web.Request) -> web.Response:
             self.upstream_requests.append((request.method, request.path_qs))
+            self.upstream_user_agents.append(request.headers.get("User-Agent", ""))
             if request.path in ("/features", "/api/features"):
                 payload: dict[str, Any] = {"assets": False, "deploy_to_cloud": False}
                 if self.upstream_features_mode == "failed_agent":
@@ -267,6 +269,17 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("GET", "/api/object_info"), self.upstream_requests)
         self.assertIn(("POST", "/prompt"), self.upstream_requests)
         self.assertIn(("GET", "/api/userdata/workflows/test.json"), self.upstream_requests)
+
+    async def test_user_agent_normalized_for_cli_clients(self) -> None:
+        self.upstream_user_agents.clear()
+        await self.client.get("/api/object_info", headers={"User-Agent": "Python-urllib/3.13"})
+        await self.client.get(
+            "/api/object_info",
+            headers={"User-Agent": "Mozilla/5.0 ComfyDesktop/1.2.2"},
+        )
+        self.assertEqual(len(self.upstream_user_agents), 2)
+        self.assertTrue(self.upstream_user_agents[0].startswith("Mozilla/5.0 "))
+        self.assertEqual(self.upstream_user_agents[1], "Mozilla/5.0 ComfyDesktop/1.2.2")
 
     async def test_features_overlay_local_agent_flag(self) -> None:
         for mode in ("missing_agent", "failed_agent"):

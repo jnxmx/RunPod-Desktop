@@ -15,6 +15,9 @@ import {
 
 const BRIDGE_BASE = "/__rp_bridge";
 const RUNPOD_API_BASE = `${BRIDGE_BASE}/runpod/v2`;
+const CNR_NODE_ID = "comfyui-runpod-desktop";
+const CNR_REPO_URL = "https://github.com/jnxmx/RunPod-Desktop";
+const MANAGER_UPDATER_CLIENT_ID = "runpod-deployer-updater";
 const CATALOG_AUTO_REFRESH_MS = 12000;
 
 const PRICE_STEPS = Object.freeze([
@@ -104,6 +107,8 @@ const state = {
   secureOnly: false,
   showUnavailable: false,
   minRamGb: 0,
+  sortBy: "speed",
+  sortDir: "desc",
   activePods: [],
   podControllers: new Map(),
   currentTemplate: { ...DEFAULT_TEMPLATE },
@@ -123,7 +128,17 @@ const state = {
   catalogRefreshTimerId: null,
   ipGeoCache: new Map(),
   apiKeyPermissionErrors: new Map(),
-  heldRetryInfo: null
+  heldRetryInfo: null,
+  logStreamsPausedForUpdate: false,
+  pluginUpdate: {
+    currentVersion: "",
+    latestVersion: null,
+    latestStatus: "",
+    updateAvailable: false,
+    isPrerelease: false,
+    phase: "idle",
+    errorMessage: ""
+  }
 };
 
 /* ==========================================================================
@@ -754,7 +769,10 @@ async function fetchAccountInfo() {
   ]);
 
   if (secretsRes.status === "fulfilled") {
-    state.accountSecrets = Array.isArray(secretsRes.value?.secrets) ? secretsRes.value.secrets : [];
+    const rawSecrets = Array.isArray(secretsRes.value)
+      ? secretsRes.value
+      : (Array.isArray(secretsRes.value?.secrets) ? secretsRes.value.secrets : []);
+    state.accountSecrets = rawSecrets;
   } else {
     console.debug("fetch secrets:", secretsRes.reason?.message);
     state.accountSecrets = [];
@@ -791,6 +809,20 @@ function updateSecretPillElement(el, label, isConfigured, secretObj) {
   }
 }
 
+function hasLiteralTemplateEnvValue(templateEnv, ...keys) {
+  if (!templateEnv || typeof templateEnv !== "object") return false;
+  const targets = new Set(keys.map((k) => String(k || "").trim().toUpperCase()));
+  for (const [rawKey, rawVal] of Object.entries(templateEnv)) {
+    const key = String(rawKey || "").trim().toUpperCase();
+    if (!targets.has(key) || rawVal == null) continue;
+    const val = String(rawVal).trim();
+    if (!val) continue;
+    if (/^\{\{\s*RUNPOD_SECRET_[^}]+\s*\}\}$/i.test(val)) continue;
+    return true;
+  }
+  return false;
+}
+
 function updateAccountBadges() {
   const hfEl = document.getElementById("status-hf-token");
   const civitaiEl = document.getElementById("status-civitai-token");
@@ -805,19 +837,19 @@ function updateAccountBadges() {
   const templateEnv = state.currentTemplate?.env || {};
 
   const hfSecret = secretsByName.get("HF_TOKEN") || secretsByName.get("HD_TOKEN") || null;
-  const isHfConfigured = Boolean(hfSecret || templateEnv.HF_TOKEN || templateEnv.HD_TOKEN);
+  const isHfConfigured = Boolean(hfSecret || hasLiteralTemplateEnvValue(templateEnv, "HF_TOKEN", "HD_TOKEN"));
   updateSecretPillElement(hfEl, "HF_TOKEN", isHfConfigured, hfSecret);
 
   const civitaiSecret = secretsByName.get("CIVITAI_API_KEY") || null;
-  const isCivitaiConfigured = Boolean(civitaiSecret || templateEnv.CIVITAI_API_KEY);
+  const isCivitaiConfigured = Boolean(civitaiSecret || hasLiteralTemplateEnvValue(templateEnv, "CIVITAI_API_KEY"));
   updateSecretPillElement(civitaiEl, "CIVITAI_API_KEY", isCivitaiConfigured, civitaiSecret);
 
   const backupSecret = secretsByName.get("COMFYUI_BACKUP") || null;
-  const isBackupConfigured = Boolean(backupSecret || templateEnv.COMFYUI_BACKUP);
+  const isBackupConfigured = Boolean(backupSecret || hasLiteralTemplateEnvValue(templateEnv, "COMFYUI_BACKUP"));
   updateSecretPillElement(backupEl, "COMFYUI_BACKUP", isBackupConfigured, backupSecret);
 
   const comfyOrgSecret = secretsByName.get("API_KEY_COMFY_ORG") || null;
-  const isComfyOrgConfigured = Boolean(comfyOrgSecret || templateEnv.API_KEY_COMFY_ORG);
+  const isComfyOrgConfigured = Boolean(comfyOrgSecret || hasLiteralTemplateEnvValue(templateEnv, "API_KEY_COMFY_ORG"));
   updateSecretPillElement(comfyOrgEl, "API_KEY_COMFY_ORG", isComfyOrgConfigured, comfyOrgSecret);
 }
 
@@ -868,7 +900,7 @@ async function loadTemplate(templateId, showFeedback = false) {
         ports: data.ports || DEFAULT_TEMPLATE.ports,
         env: data.env || {}
       };
-      await persistCustomTemplateId(cleanId);
+      await persistCustomTemplateId(cleanId === DEFAULT_TEMPLATE.templateId ? null : cleanId);
       if (showFeedback && msgEl) {
         msgEl.hidden = false;
         msgEl.className = "template-edit-msg msg-success";
@@ -880,7 +912,8 @@ async function loadTemplate(templateId, showFeedback = false) {
     state.currentTemplate = {
       ...DEFAULT_TEMPLATE,
       templateId: cleanId,
-      name: cleanId === DEFAULT_TEMPLATE.templateId ? DEFAULT_TEMPLATE.name : `Темплейт ${cleanId}`
+      name: cleanId === DEFAULT_TEMPLATE.templateId ? DEFAULT_TEMPLATE.name : `Темплейт ${cleanId}`,
+      env: {}
     };
     if (showFeedback && msgEl) {
       msgEl.hidden = false;
@@ -891,6 +924,37 @@ async function loadTemplate(templateId, showFeedback = false) {
 
   updateTemplateUI();
   updateAccountBadges();
+}
+
+function getTemplateEnvKeySet(tpl) {
+  const keys = new Set();
+  const env = tpl?.env;
+  if (env && typeof env === "object") {
+    for (const k of Object.keys(env)) {
+      const norm = String(k || "").trim().toUpperCase();
+      if (norm) keys.add(norm);
+    }
+  }
+  return keys;
+}
+
+function getTemplateSupportedOptions(tpl = state.currentTemplate) {
+  const tplId = tpl?.templateId || DEFAULT_TEMPLATE.templateId;
+  if (tplId === DEFAULT_TEMPLATE.templateId) {
+    return {
+      newManager: true,
+      restoreBackup: true,
+      beta: true,
+      shutdownTimer: true
+    };
+  }
+  const envKeys = getTemplateEnvKeySet(tpl);
+  return {
+    newManager: envKeys.has("NEW_MANAGER"),
+    restoreBackup: envKeys.has("RESTORE_BACKUP"),
+    beta: envKeys.has("NIGHTLY_COMFYUI") || envKeys.has("COMFYUI_NIGHTLY") || envKeys.has("USE_NIGHTLY"),
+    shutdownTimer: envKeys.has("RUNPOD_SHUTDOWN_MINUTES") || envKeys.has("DISABLE_SHUTDOWN_TIMER")
+  };
 }
 
 function updateTemplateUI() {
@@ -904,8 +968,26 @@ function updateTemplateUI() {
     }
   }
   if (badgeEl) badgeEl.textContent = tplId;
+
+  const supported = getTemplateSupportedOptions(state.currentTemplate);
+  const newManagerWrap = document.getElementById("opt-new-manager")?.closest(".checkbox-control");
+  if (newManagerWrap) newManagerWrap.hidden = !supported.newManager;
+  const restoreBackupWrap = document.getElementById("opt-restore-backup")?.closest(".checkbox-control");
+  if (restoreBackupWrap) restoreBackupWrap.hidden = !supported.restoreBackup;
+  const betaWrap = document.getElementById("opt-beta")?.closest(".checkbox-control");
+  if (betaWrap) betaWrap.hidden = !supported.beta;
+  const shutdownWrap = document.getElementById("opt-shutdown-timer")?.closest(".shutdown-control-group");
+  if (shutdownWrap) shutdownWrap.hidden = !supported.shutdownTimer;
+
   const optsEl = document.getElementById("template-options");
-  if (optsEl) optsEl.hidden = tplId !== DEFAULT_TEMPLATE.templateId;
+  if (optsEl) {
+    optsEl.hidden = !(
+      supported.newManager ||
+      supported.restoreBackup ||
+      supported.beta ||
+      supported.shutdownTimer
+    );
+  }
 }
 
 function initTemplateControls() {
@@ -1177,8 +1259,24 @@ function renderGpuTable() {
     const bucketDiff = getRowFilterBucket(a, maxPrice, minRamGb) - getRowFilterBucket(b, maxPrice, minRamGb);
     if (bucketDiff !== 0) return bucketDiff;
 
-    if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
-    if (a.subRank !== b.subRank) return a.subRank - b.subRank;
+    const otherA = a.tierRank === 99 ? 1 : 0;
+    const otherB = b.tierRank === 99 ? 1 : 0;
+    if (otherA !== otherB) return otherA - otherB;
+
+    if (state.sortBy === "price") {
+      const priceDiff = state.sortDir === "asc" ? a.price - b.price : b.price - a.price;
+      if (priceDiff !== 0) return priceDiff;
+    }
+
+    const speedDiff = state.sortBy === "speed" && state.sortDir === "asc"
+      ? b.sortOrder - a.sortOrder
+      : a.sortOrder - b.sortOrder;
+    if (speedDiff !== 0) return speedDiff;
+
+    const subDiff = state.sortBy === "speed" && state.sortDir === "asc"
+      ? b.subRank - a.subRank
+      : a.subRank - b.subRank;
+    if (subDiff !== 0) return subDiff;
 
     const cloudScoreA = a.cloud === "COMMUNITY" ? 0 : 1;
     const cloudScoreB = b.cloud === "COMMUNITY" ? 0 : 1;
@@ -1801,7 +1899,11 @@ function getOrCreatePodController(podId, initData = {}) {
       pod: initData.pod || null,
       status: initData.status || initData.pod?.status || "STARTING",
       containerStarted: isPodRuntimeActive(initData.pod),
-      restoreBackup: initData.restoreBackup ?? (document.getElementById("opt-restore-backup")?.checked ?? true),
+      restoreBackup: initData.restoreBackup ?? (
+        getTemplateSupportedOptions().restoreBackup
+          ? (document.getElementById("opt-restore-backup")?.checked ?? true)
+          : false
+      ),
       stages: {
         provision: "active",
         container: "pending",
@@ -1826,7 +1928,7 @@ function getOrCreatePodController(podId, initData = {}) {
     state.podControllers.set(podId, ctrl);
     ctrl.pollTimerId = setInterval(() => pollHealthForPod(ctrl), 2500);
     pollHealthForPod(ctrl);
-    if (isOur || ctrl.isExpanded) startLogStreamForPod(ctrl);
+    if (!state.logStreamsPausedForUpdate && (isOur || ctrl.isExpanded)) startLogStreamForPod(ctrl);
   }
   return ctrl;
 }
@@ -1910,7 +2012,7 @@ async function fetchActivePods() {
         syncPodStateFromApi(ctrl, pod);
       }
 
-      if ((ctrl.isOurPod || ctrl.isExpanded) && !ctrl.logAbortController) {
+      if (!state.logStreamsPausedForUpdate && (ctrl.isOurPod || ctrl.isExpanded) && !ctrl.logAbortController) {
         startLogStreamForPod(ctrl);
       }
 
@@ -1986,6 +2088,7 @@ function isPodRestoreBackupEnabled(ctrl) {
   const envVal = ctrl?.pod?.env?.RESTORE_BACKUP;
   if (envVal !== undefined) return String(envVal) === "1";
   if (ctrl?.restoreBackup !== undefined) return Boolean(ctrl.restoreBackup);
+  if (!getTemplateSupportedOptions().restoreBackup) return false;
   return document.getElementById("opt-restore-backup")?.checked ?? true;
 }
 
@@ -2363,11 +2466,43 @@ function createPodCardElement(ctrl) {
     ctrl.logsUserToggled = true;
   });
 
+  const logWrap = document.createElement("div");
+  logWrap.className = "terminal-logs-wrap";
+
+  const copyLogsBtn = document.createElement("button");
+  copyLogsBtn.type = "button";
+  copyLogsBtn.className = "btn-copy-logs";
+  copyLogsBtn.title = "Копировать логи";
+  copyLogsBtn.setAttribute("aria-label", "Копировать логи");
+  const copyIconSvg = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
+  const checkIconSvg = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>`;
+  copyLogsBtn.innerHTML = copyIconSvg;
+
   const logPre = document.createElement("pre");
   logPre.className = "terminal-logs";
   logPre.tabIndex = 0;
   logPre.textContent = `Подключение к логам пода ${ctrl.podId}...\n`;
-  logDetails.append(logSummary, logPre);
+
+  let copyResetTimer = null;
+  copyLogsBtn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const text = ctrl.logLines.length > 0 ? ctrl.logLines.join("\n") : (logPre.textContent || "");
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
+    copyLogsBtn.classList.add("is-copied");
+    copyLogsBtn.innerHTML = checkIconSvg;
+    copyLogsBtn.title = "Скопировано";
+    if (copyResetTimer) clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
+      copyLogsBtn.classList.remove("is-copied");
+      copyLogsBtn.innerHTML = copyIconSvg;
+      copyLogsBtn.title = "Копировать логи";
+      copyResetTimer = null;
+    }, 1600);
+  });
+
+  logWrap.append(logPre, copyLogsBtn);
+  logDetails.append(logSummary, logWrap);
 
   body.append(alertBox, actionRow, readyBox, logDetails);
   card.append(glow, header, body);
@@ -2530,25 +2665,46 @@ function updatePodCardElement(ctrl, cardEl) {
   }
 }
 
+function stopLogStreamForPod(ctrl) {
+  if (!ctrl) return;
+  if (ctrl.logRetryTimerId) {
+    clearTimeout(ctrl.logRetryTimerId);
+    ctrl.logRetryTimerId = null;
+  }
+  if (ctrl.logAbortController) {
+    ctrl.logAbortController.abort();
+    ctrl.logAbortController = null;
+  }
+}
+
+function pauseAllPodLogStreams() {
+  state.logStreamsPausedForUpdate = true;
+  for (const ctrl of state.podControllers.values()) {
+    stopLogStreamForPod(ctrl);
+  }
+}
+
+function resumePodLogStreams() {
+  state.logStreamsPausedForUpdate = false;
+  for (const ctrl of state.podControllers.values()) {
+    if ((ctrl.isOurPod || ctrl.isExpanded) && !ctrl.logAbortController) {
+      startLogStreamForPod(ctrl);
+    }
+  }
+}
+
 function togglePodExpanded(ctrl, cardEl) {
   ctrl.isExpanded = !ctrl.isExpanded;
   cardEl.classList.toggle("is-expanded", ctrl.isExpanded);
 
   if (ctrl.isExpanded) {
-    if (!ctrl.logAbortController) startLogStreamForPod(ctrl);
+    if (!state.logStreamsPausedForUpdate && !ctrl.logAbortController) startLogStreamForPod(ctrl);
     if (!ctrl.pollTimerId) {
       pollHealthForPod(ctrl);
       ctrl.pollTimerId = setInterval(() => pollHealthForPod(ctrl), 2500);
     }
   } else if (!ctrl.isOurPod && ctrl.stages.ready === "done") {
-    if (ctrl.logRetryTimerId) {
-      clearTimeout(ctrl.logRetryTimerId);
-      ctrl.logRetryTimerId = null;
-    }
-    if (ctrl.logAbortController) {
-      ctrl.logAbortController.abort();
-      ctrl.logAbortController = null;
-    }
+    stopLogStreamForPod(ctrl);
   }
   updatePodCardElement(ctrl, cardEl);
 }
@@ -2558,10 +2714,10 @@ function scheduleLogStreamRetry(ctrl, delayMs = 3000) {
     clearTimeout(ctrl.logRetryTimerId);
     ctrl.logRetryTimerId = null;
   }
-  if (!ctrl.isExpanded || !state.podControllers.has(ctrl.podId)) return;
+  if (state.logStreamsPausedForUpdate || !ctrl.isExpanded || !state.podControllers.has(ctrl.podId)) return;
   ctrl.logRetryTimerId = setTimeout(() => {
     ctrl.logRetryTimerId = null;
-    if (ctrl.isExpanded && state.podControllers.has(ctrl.podId) && !ctrl.logAbortController) {
+    if (!state.logStreamsPausedForUpdate && ctrl.isExpanded && state.podControllers.has(ctrl.podId) && !ctrl.logAbortController) {
       startLogStreamForPod(ctrl);
     }
   }, delayMs);
@@ -2575,6 +2731,7 @@ function setLogPlaceholderMessage(ctrl, message) {
 }
 
 async function startLogStreamForPod(ctrl) {
+  if (state.logStreamsPausedForUpdate) return;
   if (ctrl.logRetryTimerId) {
     clearTimeout(ctrl.logRetryTimerId);
     ctrl.logRetryTimerId = null;
@@ -3051,22 +3208,39 @@ function buildPayload(candidate) {
   const slug = String(rawName).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "gpu";
   const tpl = state.currentTemplate;
 
-  const env = {
-    API_KEY_COMFY_ORG: "{{ RUNPOD_SECRET_API_KEY_COMFY_ORG }}",
-    CIVITAI_API_KEY: "{{ RUNPOD_SECRET_CIVITAI_API_KEY }}",
-    COMFYUI_BACKUP: "{{ RUNPOD_SECRET_COMFYUI_BACKUP }}",
-    HF_TOKEN: "{{ RUNPOD_SECRET_HF_TOKEN }}",
-    NEW_MANAGER: newManager,
-    RESTORE_BACKUP: restoreBackup,
-    STUDENT_MODE: "0"
+  const secretsByName = new Map();
+  for (const s of state.accountSecrets || []) {
+    const rawName = String(s?.name || "").trim();
+    if (rawName) secretsByName.set(rawName.toUpperCase(), rawName);
+  }
+  const secretRef = (canonicalName) => {
+    const actualName = secretsByName.get(String(canonicalName).toUpperCase()) || canonicalName;
+    return `{{ RUNPOD_SECRET_${actualName} }}`;
   };
 
-  const isDefaultTpl = !tpl.templateId || tpl.templateId === DEFAULT_TEMPLATE.templateId;
-  if (!isDefaultTpl) {
-    delete env.NEW_MANAGER;
-    delete env.RESTORE_BACKUP;
-  } else {
-    if (document.getElementById("opt-beta")?.checked) env.NIGHTLY_COMFYUI = "1";
+  const env = {
+    API_KEY_COMFY_ORG: secretRef("API_KEY_COMFY_ORG"),
+    CIVITAI_API_KEY: secretRef("CIVITAI_API_KEY"),
+    COMFYUI_BACKUP: secretRef("COMFYUI_BACKUP"),
+    HF_TOKEN: secretRef("HF_TOKEN")
+  };
+
+  const tplId = tpl.templateId || DEFAULT_TEMPLATE.templateId;
+  const supported = getTemplateSupportedOptions(tpl);
+  const envKeys = getTemplateEnvKeySet(tpl);
+  if (tplId === DEFAULT_TEMPLATE.templateId || envKeys.has("STUDENT_MODE")) {
+    env.STUDENT_MODE = "0";
+  }
+  if (supported.newManager) {
+    env.NEW_MANAGER = newManager;
+  }
+  if (supported.restoreBackup) {
+    env.RESTORE_BACKUP = restoreBackup;
+  }
+  if (supported.beta && document.getElementById("opt-beta")?.checked) {
+    env.NIGHTLY_COMFYUI = "1";
+  }
+  if (supported.shutdownTimer) {
     if (timerEnabled) {
       env.RUNPOD_SHUTDOWN_MINUTES = String(minutes);
     } else {
@@ -3638,6 +3812,371 @@ function startAutoRefreshLoop() {
    7. Event Wiring & Init
    ========================================================================== */
 
+/* ==========================================================================
+   Plugin Update Checker & Manager v4 Updater
+   ========================================================================== */
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function renderPluginUpdateButton() {
+  const btn = document.getElementById("plugin-update-btn");
+  if (!btn) return;
+  const u = state.pluginUpdate;
+  if (!u.currentVersion && !u.latestVersion && u.phase === "idle") {
+    btn.hidden = true;
+    return;
+  }
+
+  btn.hidden = false;
+  btn.classList.remove("is-available", "is-updating", "is-reboot", "is-error");
+  btn.disabled = false;
+  btn.textContent = "";
+
+  const addSpinner = () => {
+    const sp = document.createElement("span");
+    sp.className = "loading-spinner";
+    sp.setAttribute("aria-hidden", "true");
+    btn.appendChild(sp);
+  };
+  const addLabel = (text) => {
+    const span = document.createElement("span");
+    span.textContent = text;
+    btn.appendChild(span);
+  };
+
+  if (u.phase === "checking") {
+    btn.classList.add("is-updating");
+    btn.disabled = true;
+    addSpinner();
+    addLabel(u.currentVersion ? `v${u.currentVersion} · проверка...` : "Проверка...");
+    btn.title = "Проверяем обновления в Comfy Registry...";
+    return;
+  }
+
+  if (u.phase === "updating") {
+    btn.classList.add("is-updating");
+    btn.disabled = true;
+    addSpinner();
+    addLabel(`Обновление до v${u.latestVersion || "..."}`);
+    btn.title = "Идёт установка обновления через ComfyUI-Manager...";
+    return;
+  }
+
+  if (u.phase === "reboot_ready") {
+    btn.classList.add("is-reboot");
+    addLabel("Перезапустить ComfyUI");
+    btn.title = `Обновление до v${u.latestVersion || ""} установлено. Нажмите для перезапуска ComfyUI.`;
+    return;
+  }
+
+  if (u.phase === "rebooting") {
+    btn.classList.add("is-updating");
+    btn.disabled = true;
+    addSpinner();
+    addLabel("Перезапуск...");
+    btn.title = "Ожидаем перезапуска ComfyUI...";
+    return;
+  }
+
+  if (u.phase === "error") {
+    btn.classList.add("is-error");
+    const shortErr = (u.errorMessage || "").trim().slice(0, 36);
+    if (u.updateAvailable && u.latestVersion) {
+      addLabel(`Повторить v${u.latestVersion}`);
+    } else if (shortErr) {
+      addLabel(u.currentVersion ? `v${u.currentVersion} · ${shortErr}` : shortErr);
+    } else {
+      addLabel(u.currentVersion ? `v${u.currentVersion} · ошибка` : "Ошибка проверки");
+    }
+    btn.title = u.errorMessage || "Ошибка обновления плагина";
+    return;
+  }
+
+  if (u.updateAvailable && u.latestVersion) {
+    btn.classList.add("is-available");
+    addLabel(`Обновить до v${u.latestVersion}`);
+    const statusNote = u.latestStatus === "NodeVersionStatusPending" ? " (nightly / pending)" : "";
+    btn.title = `Доступна новая версия v${u.latestVersion}${statusNote}. Текущая: v${u.currentVersion || "?"}. Нажмите для установки.`;
+    return;
+  }
+
+  if (u.phase === "up_to_date") {
+    addLabel(u.currentVersion ? `v${u.currentVersion} · обновлений нет` : "Обновлений нет");
+    btn.title = `Установлена актуальная версия v${u.currentVersion || "?"}. Нажмите для повторной проверки.`;
+    return;
+  }
+
+  addLabel(
+    u.currentVersion ? `v${u.currentVersion} · Проверить обновления` : "Проверить обновления"
+  );
+  btn.title = u.latestVersion
+    ? `Установлена актуальная версия v${u.currentVersion} (Comfy Registry: v${u.latestVersion}). Нажмите для повторной проверки.`
+    : "Нажмите, чтобы проверить обновления в Comfy Registry";
+}
+
+async function checkPluginUpdate({ force = false } = {}) {
+  const u = state.pluginUpdate;
+  if (u.phase === "updating" || u.phase === "reboot_ready" || u.phase === "rebooting") {
+    return;
+  }
+  const prevPhase = u.phase;
+  if (force) {
+    pauseAllPodLogStreams();
+    u.phase = "checking";
+    u.errorMessage = "";
+    renderPluginUpdateButton();
+  }
+
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 18000) : null;
+
+  try {
+    const qs = force ? "?force=1" : "";
+    const res = await fetch(`${BRIDGE_BASE}/plugin_update${qs}`, {
+      cache: "no-store",
+      signal: controller?.signal
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    if (data.currentVersion) {
+      u.currentVersion = data.currentVersion;
+    }
+    if (!data.ok) {
+      if (force) {
+        u.phase = "error";
+        u.errorMessage = data.error || "Не удалось проверить Comfy Registry";
+      } else {
+        u.phase = prevPhase === "checking" ? "idle" : prevPhase;
+      }
+      renderPluginUpdateButton();
+      return;
+    }
+
+    u.latestVersion = data.latestVersion || null;
+    u.latestStatus = data.latestStatus || "";
+    u.updateAvailable = Boolean(data.updateAvailable && u.latestVersion);
+    u.isPrerelease = Boolean(data.isPrerelease);
+    u.errorMessage = "";
+    if (u.updateAvailable) {
+      u.phase = "available";
+    } else if (force) {
+      u.phase = "up_to_date";
+      setTimeout(() => {
+        if (state.pluginUpdate.phase === "up_to_date") {
+          state.pluginUpdate.phase = "idle";
+          renderPluginUpdateButton();
+        }
+      }, 3500);
+    } else {
+      u.phase = "idle";
+    }
+  } catch (err) {
+    if (force) {
+      u.phase = "error";
+      u.errorMessage = err?.name === "AbortError"
+        ? "Таймаут проверки Comfy Registry"
+        : (err?.message || "Ошибка проверки обновлений");
+    } else {
+      u.phase = "idle";
+    }
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (force) resumePodLogStreams();
+  }
+  renderPluginUpdateButton();
+}
+
+function buildManagerUpdatePayload(targetVersion, currentVersion, installedEntry) {
+  const uiId = `rp-update-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const installedVer = String(installedEntry?.ver || "").trim();
+  const isGitInstall = installedVer === "nightly" || /^[0-9a-fA-F]{40}$/.test(installedVer);
+
+  if (targetVersion === "nightly" && isGitInstall) {
+    return {
+      uiId,
+      task: {
+        ui_id: uiId,
+        client_id: MANAGER_UPDATER_CLIENT_ID,
+        kind: "update",
+        params: {
+          node_name: CNR_NODE_ID,
+          node_ver: "nightly"
+        }
+      }
+    };
+  }
+
+  return {
+    uiId,
+    task: {
+      ui_id: uiId,
+      client_id: MANAGER_UPDATER_CLIENT_ID,
+      kind: "install",
+      params: {
+        id: CNR_NODE_ID,
+        version: currentVersion || "0.0.0",
+        selected_version: targetVersion,
+        repository: CNR_REPO_URL,
+        channel: "default",
+        mode: "remote"
+      }
+    }
+  };
+}
+
+async function triggerPluginUpdate() {
+  const u = state.pluginUpdate;
+  const targetVersion = u.latestVersion;
+  if (!targetVersion || u.phase === "updating" || u.phase === "rebooting") {
+    return;
+  }
+
+  pauseAllPodLogStreams();
+  u.phase = "updating";
+  u.errorMessage = "";
+  renderPluginUpdateButton();
+
+  try {
+    let installedEntry = null;
+    try {
+      const instRes = await fetch("/v2/customnode/installed", { cache: "no-store" });
+      if (instRes.ok) {
+        const instData = await instRes.json();
+        if (instData && typeof instData === "object") {
+          for (const [key, val] of Object.entries(instData)) {
+            if (
+              key.toLowerCase() === CNR_NODE_ID ||
+              String(val?.cnr_id || "").toLowerCase() === CNR_NODE_ID
+            ) {
+              installedEntry = val;
+              break;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    const { uiId, task } = buildManagerUpdatePayload(
+      targetVersion,
+      u.currentVersion,
+      installedEntry
+    );
+
+    const queueRes = await fetch("/v2/manager/queue/task", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(task)
+    });
+    if (!queueRes.ok) {
+      const errText = await queueRes.text().catch(() => "");
+      throw new Error(errText || `Manager queue/task HTTP ${queueRes.status}`);
+    }
+
+    const startRes = await fetch("/v2/manager/queue/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (!startRes.ok && startRes.status !== 201) {
+      const errText = await startRes.text().catch(() => "");
+      throw new Error(errText || `Manager queue/start HTTP ${startRes.status}`);
+    }
+
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      await sleepMs(1000);
+      const histRes = await fetch(
+        `/v2/manager/queue/history?ui_id=${encodeURIComponent(uiId)}`,
+        { cache: "no-store" }
+      );
+      if (!histRes.ok) continue;
+      const histData = await histRes.json().catch(() => null);
+      const historyObj = histData?.history;
+      if (!historyObj || typeof historyObj !== "object") continue;
+
+      const entry =
+        historyObj[uiId] ||
+        (historyObj.ui_id === uiId || historyObj.status ? historyObj : null);
+      if (!entry) continue;
+
+      const statusStr = String(entry?.status?.status_str || "").toLowerCase();
+      if (statusStr === "success" || statusStr === "skip") {
+        u.phase = "reboot_ready";
+        u.errorMessage = "";
+        renderPluginUpdateButton();
+        return;
+      }
+
+      throw new Error(entry.result || `Ошибка установки (${statusStr || "unknown"})`);
+    }
+
+    throw new Error("Истекло время ожидания ComfyUI-Manager");
+  } catch (err) {
+    u.phase = "error";
+    u.errorMessage = err?.message || "Ошибка обновления через ComfyUI-Manager";
+    renderPluginUpdateButton();
+  } finally {
+    resumePodLogStreams();
+  }
+}
+
+async function triggerManagerReboot() {
+  const u = state.pluginUpdate;
+  if (u.phase === "rebooting") return;
+  pauseAllPodLogStreams();
+  u.phase = "rebooting";
+  u.errorMessage = "";
+  renderPluginUpdateButton();
+
+  try {
+    await fetch("/v2/manager/reboot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+  } catch {
+    // Expected when server restarts via os.execv
+  }
+
+  await sleepMs(2000);
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${BRIDGE_BASE}/status`, { cache: "no-store" });
+      if (res.ok) {
+        window.location.reload();
+        return;
+      }
+    } catch {}
+    await sleepMs(1500);
+  }
+
+  u.phase = "error";
+  u.errorMessage = "ComfyUI не ответил после перезапуска. Обновите страницу вручную.";
+  renderPluginUpdateButton();
+}
+
+function initPluginUpdateControls() {
+  const btn = document.getElementById("plugin-update-btn");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const u = state.pluginUpdate;
+    if (u.phase === "reboot_ready") {
+      triggerManagerReboot();
+      return;
+    }
+    if (u.phase === "available" || (u.phase === "error" && u.updateAvailable)) {
+      triggerPluginUpdate();
+      return;
+    }
+    checkPluginUpdate({ force: true });
+  });
+}
+
 async function init() {
   initExternalLinkDelegation();
   initTemplateControls();
@@ -3735,6 +4274,45 @@ async function init() {
       });
     }
   }
+
+  // Table Column Sort (ephemeral — resets to speed on page reload)
+  const sortPriceBtn = document.getElementById("sort-price-btn");
+  const sortPowerBtn = document.getElementById("sort-power-btn");
+  const updateSortHeaderUi = () => {
+    const isPrice = state.sortBy === "price";
+    const isAsc = state.sortDir === "asc";
+    if (sortPriceBtn) {
+      sortPriceBtn.classList.toggle("is-active", isPrice);
+      sortPriceBtn.classList.toggle("is-asc", isPrice && isAsc);
+      sortPriceBtn.closest("th")?.setAttribute("aria-sort", isPrice ? (isAsc ? "ascending" : "descending") : "none");
+    }
+    if (sortPowerBtn) {
+      sortPowerBtn.classList.toggle("is-active", !isPrice);
+      sortPowerBtn.classList.toggle("is-asc", !isPrice && isAsc);
+      sortPowerBtn.closest("th")?.setAttribute("aria-sort", !isPrice ? (isAsc ? "ascending" : "descending") : "none");
+    }
+  };
+  updateSortHeaderUi();
+  sortPriceBtn?.addEventListener("click", () => {
+    if (state.sortBy === "price") {
+      state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      state.sortBy = "price";
+      state.sortDir = "asc";
+    }
+    updateSortHeaderUi();
+    renderGpuTable();
+  });
+  sortPowerBtn?.addEventListener("click", () => {
+    if (state.sortBy === "speed") {
+      state.sortDir = state.sortDir === "desc" ? "asc" : "desc";
+    } else {
+      state.sortBy = "speed";
+      state.sortDir = "desc";
+    }
+    updateSortHeaderUi();
+    renderGpuTable();
+  });
 
   // Key Visibility & Safety Info
   const keyInput = document.getElementById("runpod-api-key");
@@ -4301,7 +4879,7 @@ async function init() {
     refreshPodsBtn.addEventListener("click", async () => {
       refreshPodsBtn.classList.add("is-spinning");
       try {
-        await Promise.all([fetchActivePods(), fetchBalance()]);
+        await Promise.all([fetchActivePods(), fetchBalance(), fetchAccountInfo()]);
       } finally {
         refreshPodsBtn.classList.remove("is-spinning");
       }
@@ -4317,11 +4895,16 @@ async function init() {
       state.hasApiKey = Boolean(statusData.hasApiKey);
       state.maskedKey = statusData.maskedKey || "";
       savedTemplateId = statusData.customTemplateId || null;
+      state.pluginUpdate.currentVersion = statusData.version || "";
     }
   } catch {
   } finally {
     state.statusLoaded = true;
   }
+
+  initPluginUpdateControls();
+  renderPluginUpdateButton();
+  checkPluginUpdate();
 
   try {
     if (state.hasApiKey) localStorage.setItem(STORAGE_KEYS.HAD_KEY_HINT, "1");
