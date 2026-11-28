@@ -139,7 +139,7 @@ class BridgeAPI:
 
         if path.startswith("/__rp_bridge/pod_health/") and method == "GET":
             pod_id = path[len("/__rp_bridge/pod_health/"):]
-            return await self._handle_pod_health(pod_id)
+            return await self._handle_pod_health(request, pod_id)
 
         if (
             path.startswith("/__rp_bridge/pods/")
@@ -351,12 +351,18 @@ class BridgeAPI:
         api_key = get_api_key(self.config_path)
         return await self.client.proxy_rest_v2(request, subpath, api_key)
 
-    async def _handle_pod_health(self, pod_id: str) -> web.Response:
+    async def _handle_pod_health(self, request: web.Request, pod_id: str) -> web.Response:
         denied = self._require_deployer_mode()
         if denied is not None:
             return denied
 
-        status, data = await self.client.check_pod_health(pod_id)
+        try:
+            raw_port = int(request.query.get("port") or 7860)
+        except (TypeError, ValueError):
+            raw_port = 7860
+        port = raw_port if 1 <= raw_port <= 65535 else 7860
+        token = str(request.query.get("token") or "").strip()
+        status, data = await self.client.check_pod_health(pod_id, port=port, token=token)
         return web.json_response(data, status=status, headers={"Cache-Control": "no-store"})
 
     async def _handle_pod_logs_ws(self, request: web.Request, pod_id: str) -> web.StreamResponse:
@@ -443,11 +449,20 @@ class BridgeAPI:
         except (TypeError, ValueError):
             active_pods_hourly = price
 
+        try:
+            raw_port = int(body.get("port") or 7860)
+        except (TypeError, ValueError):
+            raw_port = 7860
+        port_num = raw_port if 1 <= raw_port <= 65535 else 7860
+        token = str(body.get("token") or "").strip()
+
         active_pod = {
             "podId": pod_id,
             "gpuName": str(body.get("gpuName") or "GPU").strip() or "GPU",
             "price": price,
             "cloudType": str(body.get("cloudType") or "COMMUNITY").strip().upper(),
+            "port": port_num,
+            "token": token,
             "startedAtMs": started_at_ms,
             "activePodsCount": active_pods_count,
             "activePodsHourly": active_pods_hourly,

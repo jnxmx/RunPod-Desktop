@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-runpod-desktop"
 description = "Comfy Course Deployer — local RunPod deployer, GraphQL balance monitor, and transparent HTTP/WebSocket proxy inside Comfy Desktop."
-version = "0.1.5"
+version = "0.1.6"
 license = { text = "MIT" }
 dependencies = []
 

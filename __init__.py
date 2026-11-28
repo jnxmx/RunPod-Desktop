@@ -64,11 +64,23 @@ def create_bridge_middleware(
             if not pod_id:
                 api.state.mode = "deployer"
             else:
+                try:
+                    raw_port = int((api.state.active_pod or {}).get("port") or 7860)
+                except (TypeError, ValueError):
+                    raw_port = 7860
+                target_port = raw_port if 1 <= raw_port <= 65535 else 7860
+                target_token = str((api.state.active_pod or {}).get("token") or "").strip()
                 upgrade = request.headers.get("Upgrade", "").lower()
                 if path == "/ws" or upgrade == "websocket":
-                    return await proxy.handle_ws_proxy(request, pod_id)
+                    return await proxy.handle_ws_proxy(request, pod_id, port=target_port, token=target_token)
                 clear_cache = api.consume_clear_cache_flag() if (request.method == "GET" and path == "/") else False
-                return await proxy.handle_http_proxy(request, pod_id, clear_cache=clear_cache)
+                return await proxy.handle_http_proxy(
+                    request,
+                    pod_id,
+                    port=target_port,
+                    token=target_token,
+                    clear_cache=clear_cache,
+                )
 
         # Deployer mode
         if path in LOCAL_HEALTHCHECK_PATHS:

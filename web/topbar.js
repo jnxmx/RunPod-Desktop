@@ -1,5 +1,6 @@
 (() => {
   if (window.__RUNPOD_DESKTOP_TOPBAR_LOADED__) return;
+  if (window.top !== window.self) return;
   window.__RUNPOD_DESKTOP_TOPBAR_LOADED__ = true;
 
   let autoDownloadEnabled = true;
@@ -359,10 +360,52 @@
       font-weight: 500;
       font-variant-numeric: tabular-nums;
     }
+    .wrap.is-back-only .bar {
+      padding: 4px 8px;
+    }
+    .wrap.is-back-only .status {
+      cursor: pointer;
+      padding: 0 2px;
+    }
+    .wrap.is-back-only .actions-drawer,
+    .wrap.is-back-only .status-wing,
+    .wrap.is-back-only .status-center,
+    .wrap.is-back-only .pods-badge {
+      display: none !important;
+    }
+    .back-only-btn {
+      display: none;
+      height: 24px;
+      padding: 0 8px;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      background: transparent;
+      border: none;
+      border-radius: 999px;
+      color: #e4e4e7;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background-color 0.16s ease, color 0.16s ease;
+    }
+    .back-only-btn:hover:not(:disabled) {
+      background: var(--secondary, rgba(255, 255, 255, 0.08));
+      color: #ffffff;
+    }
+    .back-only-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .wrap.is-back-only .back-only-btn {
+      display: inline-flex;
+    }
   `;
 
   const wrap = document.createElement("div");
-  wrap.className = "wrap";
+  wrap.className = "wrap is-back-only";
 
   const bar = document.createElement("div");
   bar.className = "bar";
@@ -405,7 +448,13 @@
   const statusRight = document.createElement("span");
   statusRight.className = "status-wing status-right";
 
-  statusEl.append(podsBadge, statusLeft, statusCenter, statusRight);
+  const backOnlyBtn = document.createElement("button");
+  backOnlyBtn.type = "button";
+  backOnlyBtn.className = "back-only-btn";
+  backOnlyBtn.setAttribute("aria-label", "Back to pods");
+  backOnlyBtn.innerHTML = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 8H3.5"/><path d="M7 4.5 3.5 8 7 11.5"/></svg><span>Back to pods</span>`;
+
+  statusEl.append(podsBadge, statusLeft, statusCenter, statusRight, backOnlyBtn);
 
   const actionsDrawer = document.createElement("div");
   actionsDrawer.className = "actions-drawer";
@@ -472,6 +521,7 @@
   let collapseTimer = null;
 
   function keepExpanded() {
+    if (wrap.classList.contains("is-back-only")) return;
     if (collapseTimer !== null) {
       clearTimeout(collapseTimer);
       collapseTimer = null;
@@ -508,6 +558,7 @@
     if (!wrap.contains(e.relatedTarget)) scheduleCollapse();
   });
   statusEl.addEventListener("click", () => {
+    if (wrap.classList.contains("is-back-only")) return;
     if (wrap.classList.contains("is-expanded") || wrap.classList.contains("is-confirming")) {
       collapseNow();
     } else {
@@ -593,11 +644,13 @@
 
   async function disconnectAndReload() {
     backBtn.disabled = true;
+    backOnlyBtn.disabled = true;
     await fetch("/__rp_bridge/disconnect", { method: "POST" });
     window.location.reload();
   }
 
   backBtn.addEventListener("click", disconnectAndReload);
+  backOnlyBtn.addEventListener("click", disconnectAndReload);
 
   function notifyPillError(summary, message) {
     try {
@@ -850,7 +903,11 @@
         autoDownloadEnabled = data.autoDownloadOutputs;
       }
       const pod = data?.activePod;
-      if (!pod) return;
+      if (!pod || !pod.podId) {
+        wrap.classList.add("is-back-only");
+        return;
+      }
+      wrap.classList.remove("is-back-only");
       activePodId = pod.podId || "";
       hourlyPrice = Number(pod.price) || 0;
       startedAtMs = Number(pod.startedAtMs) || Date.now();

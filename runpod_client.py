@@ -509,19 +509,29 @@ class RunPodClient:
                 await ws.close()
         return ws
 
-    async def check_pod_health(self, pod_id: str) -> tuple[int, dict]:
-        """Check whether the ComfyUI server on port 7860 of a pod is responding."""
+    async def check_pod_health(self, pod_id: str, port: int = 7860, token: str = "") -> tuple[int, dict]:
+        """Check whether the target HTTP service on a pod is responding."""
         if not is_valid_pod_id(pod_id):
             return 400, {"ok": False, "error": "Invalid pod ID"}
 
-        url = f"https://{pod_id}-7860.proxy.runpod.net/system_stats"
+        target_port = int(port) if 1 <= int(port) <= 65535 else 7860
+        path = "/system_stats" if target_port == 7860 else "/"
+        url = f"https://{pod_id}-{target_port}.proxy.runpod.net{path}"
+        headers = {"Cache-Control": "no-store"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         session = await self.get_session()
         try:
             async with session.get(
                 url,
-                headers={"Cache-Control": "no-store"},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=5),
+                allow_redirects=False,
             ) as resp:
+                if target_port != 7860:
+                    if resp.status in (502, 503, 504):
+                        return resp.status, {"ok": False, "status": resp.status}
+                    return 200, {"ok": True, "stats": None}
                 if not resp.ok:
                     return resp.status, {"ok": False, "status": resp.status}
                 try:

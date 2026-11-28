@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gzip
+import html
 import json
 import re
 import zlib
@@ -52,14 +53,14 @@ def _normalize_upstream_user_agent(value: Optional[str]) -> str:
     return DEFAULT_UPSTREAM_USER_AGENT
 
 
-def build_pod_http_origin(pod_id: str) -> str:
-    """Return the RunPod proxy HTTPS origin for a pod's ComfyUI port 7860."""
-    return f"https://{pod_id}-7860.proxy.runpod.net"
+def build_pod_http_origin(pod_id: str, port: int = 7860) -> str:
+    """Return the RunPod proxy HTTPS origin for a pod's target HTTP port."""
+    return f"https://{pod_id}-{int(port)}.proxy.runpod.net"
 
 
-def build_pod_ws_origin(pod_id: str) -> str:
-    """Return the RunPod proxy WSS origin for a pod's ComfyUI port 7860."""
-    return f"wss://{pod_id}-7860.proxy.runpod.net"
+def build_pod_ws_origin(pod_id: str, port: int = 7860) -> str:
+    """Return the RunPod proxy WSS origin for a pod's target WebSocket port."""
+    return f"wss://{pod_id}-{int(port)}.proxy.runpod.net"
 
 
 def _rewrite_origin_or_referer(value: str, target_origin: str) -> str:
@@ -160,6 +161,21 @@ def _rewrite_ws_agent_frame(raw_text: str, local_flag: Optional[dict[str, Any]])
         parsed["data"] = dict(local_flag)
         return json.dumps(parsed)
     return raw_text
+
+
+def _wrap_plain_text_with_topbar(body_bytes: bytes, charset: str = "utf-8") -> bytes:
+    """Wrap a plain-text document response in HTML so topbar.js can render."""
+    text = body_bytes.decode(charset or "utf-8", errors="replace")
+    escaped = html.escape(text)
+    topbar_tag = TOPBAR_SCRIPT_TAG.decode("utf-8")
+    doc = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<style>body{margin:0;padding:16px;background:#0d0e11;color:#e4e5e8;"
+        "font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;}"
+        "pre{margin:0;font:inherit;white-space:pre-wrap;}</style></head>"
+        f"<body><pre>{escaped}</pre>{topbar_tag}</body></html>"
+    )
+    return doc.encode("utf-8")
 
 
 def _load_reconnecting_html() -> str:
@@ -289,20 +305,37 @@ class PodProxy:
             },
         )
 
+    def _build_http_origin(self, pod_id: str, port: int = 7860) -> str:
+        try:
+            return self._http_origin_builder(pod_id, port)
+        except TypeError:
+            return self._http_origin_builder(pod_id)
+
+    def _build_ws_origin(self, pod_id: str, port: int = 7860) -> str:
+        try:
+            return self._ws_origin_builder(pod_id, port)
+        except TypeError:
+            return self._ws_origin_builder(pod_id)
+
     async def handle_http_proxy(
         self,
         request: web.Request,
         pod_id: str,
         *,
+        port: int = 7860,
+        token: str = "",
         clear_cache: bool = False,
     ) -> web.StreamResponse:
         """Proxy an HTTP request to the active pod, injecting topbar.js on GET /."""
         if not is_valid_pod_id(pod_id):
             return web.Response(status=400, text="Invalid pod ID")
 
-        target_origin = self._http_origin_builder(pod_id)
+        target_origin = self._build_http_origin(pod_id, port)
         target_url = f"{target_origin}{request.rel_url}"
         is_root_html = request.method == "GET" and request.path == "/"
+        is_document_nav = request.method == "GET" and (
+            is_root_html or "text/html" in request.headers.get("Accept", "").lower()
+        )
         local_agent_flag = self._agent_feature_provider() if self._agent_feature_provider is not None else None
         is_features_json = (
             request.method == "GET"
@@ -313,8 +346,10 @@ class PodProxy:
         headers = self._build_upstream_headers(
             request,
             target_origin,
-            force_identity=(is_root_html or is_features_json or is_system_stats_json),
+            force_identity=(is_document_nav or is_features_json or is_system_stats_json),
         )
+        if token and not any(k.lower() == "authorization" for k in headers):
+            headers["Authorization"] = f"Bearer {token}"
 
         session = await self.get_session()
 
@@ -340,15 +375,15 @@ class PodProxy:
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=15 if is_root_html else None, connect=15),
             ) as upstream_resp:
-                if is_root_html:
-                    if upstream_resp.status in (502, 503, 504):
+                if is_document_nav:
+                    if is_root_html and upstream_resp.status in (502, 503, 504):
                         return self._reconnecting_response(status=503)
 
                     raw_body = await upstream_resp.read()
                     content_type = upstream_resp.headers.get("Content-Type", "").lower()
                     content_encoding = upstream_resp.headers.get("Content-Encoding", "")
 
-                    if "text/html" in content_type or not content_type:
+                    if "text/html" in content_type or (not content_type and is_root_html):
                         decoded_body, ok = _decode_compressed_body(raw_body, content_encoding)
                         if ok:
                             modified = _inject_topbar_script(decoded_body)
@@ -364,6 +399,28 @@ class PodProxy:
                                 headers=resp_headers,
                                 body=modified,
                             )
+                    elif "text/plain" in content_type:
+                        decoded_body, ok = _decode_compressed_body(raw_body, content_encoding)
+                        wrapped = _wrap_plain_text_with_topbar(
+                            decoded_body if ok else raw_body,
+                            upstream_resp.charset or "utf-8",
+                        )
+                        resp_headers = self._build_response_headers(
+                            upstream_resp.headers,
+                            target_origin,
+                            drop_encoding=True,
+                            path=request.path,
+                            clear_cache=clear_cache,
+                        )
+                        for k in list(resp_headers.keys()):
+                            if k.lower() == "content-type":
+                                del resp_headers[k]
+                        resp_headers["Content-Type"] = "text/html; charset=utf-8"
+                        return web.Response(
+                            status=upstream_resp.status,
+                            headers=resp_headers,
+                            body=wrapped,
+                        )
 
                     resp_headers = self._build_response_headers(
                         upstream_resp.headers,
@@ -473,13 +530,20 @@ class PodProxy:
                 return self._reconnecting_response(status=503)
             return web.Response(status=502, text=f"Upstream pod error: {exc}")
 
-    async def handle_ws_proxy(self, request: web.Request, pod_id: str) -> web.StreamResponse:
+    async def handle_ws_proxy(
+        self,
+        request: web.Request,
+        pod_id: str,
+        *,
+        port: int = 7860,
+        token: str = "",
+    ) -> web.StreamResponse:
         """Proxy a bidirectional WebSocket (/ws) preserving TEXT and BINARY frames."""
         if not is_valid_pod_id(pod_id):
             return web.Response(status=400, text="Invalid pod ID")
 
-        http_origin = self._http_origin_builder(pod_id)
-        ws_origin = self._ws_origin_builder(pod_id)
+        http_origin = self._build_http_origin(pod_id, port)
+        ws_origin = self._build_ws_origin(pod_id, port)
         target_ws_url = f"{ws_origin}{request.rel_url}"
         parsed_http = urlparse(http_origin)
 
@@ -490,6 +554,8 @@ class PodProxy:
         }
         if "Cookie" in request.headers:
             ws_headers["Cookie"] = request.headers["Cookie"]
+        if token and "Authorization" not in request.headers:
+            ws_headers["Authorization"] = f"Bearer {token}"
 
         session = await self.get_session()
         is_comfy_main_ws = request.path == "/ws"
